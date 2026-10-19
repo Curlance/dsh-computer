@@ -1,0 +1,5 @@
+node_modules/
+*.log
+verify.err
+verify.out
+.DS_Store
