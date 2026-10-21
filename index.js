@@ -4,13 +4,17 @@ import { APPROVAL_MODES, DEFAULT_CONFIG } from './lib/config.js'
 
 export const name = 'dsh-computer'
 
-/** Plugin config schema exposed to DSH. */
+/**
+ * Plugin config schema exposed to DSH.
+ * Constraints mirror RULES in `lib/config.js` so every schema-valid value also
+ * passes `normalizeConfig()`; keep both in sync when adding fields.
+ */
 export const Config = z.object({
   cursor: z.object({
     enabled: z.boolean().default(DEFAULT_CONFIG.cursor.enabled),
-    theme: z.string().default(DEFAULT_CONFIG.cursor.theme),
-    idleHideMs: z.number().default(DEFAULT_CONFIG.cursor.idleHideMs),
-    glideMs: z.number().default(DEFAULT_CONFIG.cursor.glideMs),
+    theme: z.string().min(1).default(DEFAULT_CONFIG.cursor.theme),
+    idleHideMs: z.natural().default(DEFAULT_CONFIG.cursor.idleHideMs),
+    glideMs: z.natural().default(DEFAULT_CONFIG.cursor.glideMs),
   }),
   approvals: z.object({
     mode: z.union(APPROVAL_MODES).default(DEFAULT_CONFIG.approvals.mode),
@@ -18,19 +22,19 @@ export const Config = z.object({
   policy: z.object({
     allowedApps: z.array(z.string()).default(DEFAULT_CONFIG.policy.allowedApps),
     blockedApps: z.array(z.string()).default(DEFAULT_CONFIG.policy.blockedApps),
-    maxActionsPerMinute: z.number().default(DEFAULT_CONFIG.policy.maxActionsPerMinute),
+    maxActionsPerMinute: z.natural().min(1).default(DEFAULT_CONFIG.policy.maxActionsPerMinute),
   }),
   audit: z.object({
-    path: z.string().default(DEFAULT_CONFIG.audit.path),
+    path: z.string().min(1).default(DEFAULT_CONFIG.audit.path),
     includeScreenshots: z.boolean().default(DEFAULT_CONFIG.audit.includeScreenshots),
   }),
   backend: z.object({
-    timeoutMs: z.number().default(DEFAULT_CONFIG.backend.timeoutMs),
+    timeoutMs: z.natural().min(1).default(DEFAULT_CONFIG.backend.timeoutMs),
   }),
   observation: z.object({
-    maxElements: z.number().default(DEFAULT_CONFIG.observation.maxElements),
-    maxImageDimension: z.number().default(DEFAULT_CONFIG.observation.maxImageDimension),
-    ttlMs: z.number().default(DEFAULT_CONFIG.observation.ttlMs),
+    maxElements: z.natural().min(1).default(DEFAULT_CONFIG.observation.maxElements),
+    maxImageDimension: z.natural().min(1).default(DEFAULT_CONFIG.observation.maxImageDimension),
+    ttlMs: z.natural().min(1).default(DEFAULT_CONFIG.observation.ttlMs),
   }),
 })
 
