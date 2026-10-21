@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
  * Install dsh-computer without a preset:
- *   1. copy this package to `<dsh-home>/plugins/dsh-computer/<version>/`;
- *   2. point `<dsh-home>/profiles/<profile>/node_modules/dsh-computer` at it;
- *   3. write the managed root plugin row into `<dsh-home>/cordis.patch.yml`.
+ *   1. migrate the legacy `dsh-computer-use` install into a rollback point;
+ *   2. copy this package to `<dsh-home>/plugins/dsh-computer/<version>/`;
+ *   3. point `<dsh-home>/profiles/<profile>/node_modules/dsh-computer` at it;
+ *   4. write the managed root plugin row into `<dsh-home>/cordis.patch.yml`.
  *
  * `<dsh-home>` is `<home>/.dsh`, `$DSH_HOME` or `~/.dsh`. Every path can be
  * redirected (--home/--profile/--patch) so tests never touch the real `~/.dsh`;
- * --dry-run prints the plan without writing anything.
+ * --dry-run prints the plan without writing anything. --rollback restores the
+ * patch and legacy package recorded by the last migration.
  */
 
 import { cp, lstat, mkdir, readFile, readlink, rename, symlink, unlink, writeFile } from 'node:fs/promises'
@@ -17,7 +19,8 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
 import { DEFAULT_CONFIG } from '../lib/config.js'
-import { ensureLegacyMigration, ensurePluginRow } from '../lib/install/patch.js'
+import { applyMigration, planMigration, rollbackMigration } from '../lib/install/migrate.js'
+import { ensurePluginRow } from '../lib/install/patch.js'
 
 const PACKAGE_NAME = 'dsh-computer'
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -34,6 +37,8 @@ Options:
                     (default: $DSH_HOME, or ~/.dsh when DSH_HOME is unset)
   --profile <name>  DSH profile name (default: desktop)
   --patch <path>    Patch file to edit (default: <dsh-home>/cordis.patch.yml)
+  --rollback        Restore the patch and legacy package recorded by the last
+                    migration (run uninstall first to unregister this plugin)
   --dry-run         Print planned actions without writing anything
   -h, --help        Show this help
 `
@@ -50,26 +55,43 @@ async function main() {
   const dryRun = values['dry-run'] === true
   const actions = []
 
-  const previousPatch = await readTextIfExists(layout.patchPath)
-  const migration = ensureLegacyMigration(previousPatch ?? '')
-  if (migration.removedPreset) {
-    const rows = migration.removedRows.length > 0 ? ` (${migration.removedRows.join(', ')})` : ''
-    actions.push(`migrate: removed legacy dsh-computer-use block${rows}`)
+  if (values.rollback) {
+    const result = await rollbackMigration({
+      pluginsDir: layout.pluginsDir,
+      backupDir: layout.migrationBackupDir,
+      ...(values.patch === undefined ? {} : { patchPath: layout.patchPath }),
+      dryRun,
+    })
+    const prefix = dryRun ? '[dry-run] ' : ''
+    for (const name of result.restored) actions.push(`${prefix}rollback: restore ${name}`)
+    actions.push(`${prefix}rollback: patch <- ${result.backupPath}`)
+    actions.push(`${prefix}rollback: ${dryRun ? 'would write' : 'wrote'} ${result.patchPath}`)
+    print(actions)
+    return
   }
 
-  const nextPatch = ensurePluginRow(migration.text, {
+  const previousPatch = await readTextIfExists(layout.patchPath)
+  const plan = await planMigration({
+    patchText: previousPatch ?? '',
+    pluginsDir: layout.pluginsDir,
+    profileNodeModules: layout.profileNodeModules,
+    patchPath: layout.patchPath,
+  })
+  const nextPatch = ensurePluginRow(plan.nextPatchText, {
     id: PACKAGE_NAME,
     name: PACKAGE_NAME,
     config: PATCH_CONFIG,
   })
+  const patchChanged = nextPatch !== (previousPatch ?? '')
 
   if (dryRun) {
+    for (const action of plan.actions) actions.push(`[dry-run] migrate: ${describeAction(action)}`)
     actions.push(`[dry-run] copy ${PACKAGE_NAME}@${manifest.version} -> ${layout.versionDir}`)
     actions.push(`[dry-run] link ${layout.linkPath} -> ${layout.versionDir}`)
     actions.push(
-      nextPatch === previousPatch
-        ? `[dry-run] patch unchanged: ${layout.patchPath}`
-        : `[dry-run] patch ${layout.patchPath} (backup old patch in ${layout.backupDir})`,
+      patchChanged
+        ? `[dry-run] patch ${layout.patchPath}${backupHint(plan, layout)}`
+        : `[dry-run] patch unchanged: ${layout.patchPath}`,
     )
     print(actions)
     return
@@ -81,9 +103,16 @@ async function main() {
   const linkChanged = await ensurePackageLink(layout.linkPath, layout.versionDir)
   actions.push(`${linkChanged ? 'link' : 'link unchanged'}: ${layout.linkPath} -> ${layout.versionDir}`)
 
-  if (nextPatch === previousPatch) {
-    actions.push(`patch unchanged: ${layout.patchPath}`)
-  } else {
+  if (plan.actions.length > 0) {
+    for (const action of plan.actions) actions.push(`migrate: ${describeAction(action)}`)
+    const applied = await applyMigration({ ...plan, nextPatchText: nextPatch })
+    if (applied.backupPath) actions.push(`backup: ${applied.backupPath}`)
+    actions.push(
+      applied.writtenPatch
+        ? `patch: wrote ${layout.patchPath}`
+        : `patch unchanged: ${layout.patchPath}`,
+    )
+  } else if (patchChanged) {
     const backupPath = await backupAndWritePatch(
       layout.patchPath,
       nextPatch,
@@ -92,9 +121,25 @@ async function main() {
     )
     actions.push(`patch: wrote ${layout.patchPath}`)
     if (backupPath) actions.push(`backup: ${backupPath}`)
+  } else {
+    actions.push(`patch unchanged: ${layout.patchPath}`)
   }
 
   print(actions)
+}
+
+function describeAction(action) {
+  if (action.kind === 'remove-preset') {
+    const rows = action.detail.rows.length > 0 ? ` (${action.detail.rows.join(', ')})` : ''
+    return `remove legacy dsh-computer-use preset block${rows}`
+  }
+  if (action.kind === 'move-package') return `move ${action.detail.name} -> ${action.detail.to}`
+  if (action.kind === 'write-backup') return `back up patch -> ${action.detail.patchPath}`
+  return action.kind
+}
+
+function backupHint(plan, layout) {
+  return plan.backupPath ? ` (backup in ${plan.backupPath})` : ` (backup old patch in ${layout.backupDir})`
 }
 
 function parseCli(argv) {
@@ -105,6 +150,7 @@ function parseCli(argv) {
         home: { type: 'string' },
         profile: { type: 'string', default: 'desktop' },
         patch: { type: 'string' },
+        rollback: { type: 'boolean', default: false },
         'dry-run': { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
       },
@@ -134,11 +180,16 @@ function resolveLayout(values, version) {
   const home = values.home === undefined ? null : resolve(values.home)
   const envHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const dshHome = home === null ? resolve(envHome) : join(home, '.dsh')
+  const pluginsDir = join(dshHome, 'plugins')
+  const profileNodeModules = join(dshHome, 'profiles', values.profile, 'node_modules')
   return {
-    versionDir: join(dshHome, 'plugins', PACKAGE_NAME, version),
-    linkPath: join(dshHome, 'profiles', values.profile, 'node_modules', PACKAGE_NAME),
+    pluginsDir,
+    profileNodeModules,
+    versionDir: join(pluginsDir, PACKAGE_NAME, version),
+    linkPath: join(profileNodeModules, PACKAGE_NAME),
     patchPath: resolve(values.patch ?? join(dshHome, 'cordis.patch.yml')),
     backupDir: join(dshHome, 'computer', 'backup'),
+    migrationBackupDir: join(pluginsDir, '_backup'),
   }
 }
 
