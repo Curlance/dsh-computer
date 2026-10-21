@@ -1,0 +1,27 @@
+{
+  "name": "dsh-computer",
+  "version": "0.1.0",
+  "description": "独立自研的 DSH 常驻 computer 插件：统一 computer 工具、可见 AI 光标、审批与审计。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": "./index.js",
+  "files": [
+    "index.js",
+    "lib/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/schemastery": ">=3.18.5 <4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "3.18.5"
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  }
+}
