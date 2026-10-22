@@ -109,40 +109,59 @@ test('invalid idle readings are treated as unknown and never throw', async () =>
   assert.equal((await syncThrow.status()).control, 'unknown')
 })
 
-test('an agent action inside the gate window is not treated as user activity', async () => {
+test('an agent action stays attributed to the agent across a slow model round-trip', async () => {
   const clock = makeClock(10000)
-  let idle = 120
-  const gate = createControlGate({ now: clock.now, idleProvider: async () => idle, gateMs: 700 })
+  let lastInput = 10000
+  const gate = createControlGate({
+    now: clock.now,
+    idleProvider: async () => clock.now() - lastInput,
+    gateMs: 700,
+  })
 
   gate.noteAgentAction()
+  assert.equal((await gate.status()).control, 'ready')
+
+  clock.advance(1900) // normal model round-trip: 1.9s idle, no user input
   assert.deepEqual(await gate.status(), {
     control: 'ready',
-    lastInputAgeMs: 120,
+    lastInputAgeMs: 1900,
     waitSeconds: 0,
   })
   assert.equal((await gate.assertAgentAllowed()).allowed, true)
 
-  clock.advance(700)
+  clock.advance(5000)
   assert.equal((await gate.status()).control, 'ready')
-
-  clock.advance(1)
-  idle = 701
-  assert.deepEqual(await gate.status(), {
-    control: 'user',
-    lastInputAgeMs: 701,
-    waitSeconds: 2.3,
-  })
 })
 
-test('own-action gating does not suppress user control once the window passes', async () => {
+test('real user input after an agent action takes control', async () => {
   const clock = makeClock(0)
-  const gate = createControlGate({ now: clock.now, idleProvider: async () => 50, gateMs: 100 })
+  let lastInput = 0
+  const gate = createControlGate({
+    now: clock.now,
+    idleProvider: async () => clock.now() - lastInput,
+    gateMs: 100,
+  })
   gate.noteAgentAction()
 
-  clock.advance(101)
+  clock.advance(1500)
+  lastInput = 1100 // user moved the mouse 400ms ago
   const result = await gate.assertAgentAllowed()
   assert.equal(result.allowed, false)
   assert.equal(result.reason, 'user-active')
+  assert.equal(result.control, 'user')
+})
+
+test('input at the same instant as the agent action is attributed to the agent', async () => {
+  const clock = makeClock(0)
+  let lastInput = 0
+  const gate = createControlGate({
+    now: clock.now,
+    idleProvider: async () => clock.now() - lastInput,
+  })
+  clock.advance(800)
+  gate.noteAgentAction()
+  clock.advance(2000)
+  assert.equal((await gate.status()).control, 'ready')
 })
 
 test('control gate rejects invalid construction options', () => {
