@@ -7,7 +7,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
-import { doctor } from '../scripts/doctor.mjs'
+import { detectDshVersion, doctor } from '../scripts/doctor.mjs'
 
 const run = promisify(execFile)
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -70,12 +70,20 @@ function checksByName(result) {
   return Object.fromEntries(result.checks.map((check) => [check.name, check]))
 }
 
+/** Keep child processes inside the scratch tree even if they ignore `--home`. */
+function scratchEnv(home, dshHome = join(home, '.dsh')) {
+  const env = { ...process.env, HOME: home, USERPROFILE: home, DSH_HOME: dshHome }
+  delete env.DSH_VERSION
+  delete env.DSH_APP_PACKAGE_JSON
+  return env
+}
+
 async function install(home) {
-  return run(process.execPath, [INSTALL, '--home', home], { cwd: REPO_ROOT })
+  return run(process.execPath, [INSTALL, '--home', home], { cwd: REPO_ROOT, env: scratchEnv(home) })
 }
 
 async function uninstall(home) {
-  return run(process.execPath, [UNINSTALL, '--home', home], { cwd: REPO_ROOT })
+  return run(process.execPath, [UNINSTALL, '--home', home], { cwd: REPO_ROOT, env: scratchEnv(home) })
 }
 
 test('install writes the managed root row, version dir and profile link', async (t) => {
@@ -207,7 +215,7 @@ test('doctor CLI prints JSON and exits 1 when checks fail', async (t) => {
   await assert.rejects(
     run(process.execPath, [join(REPO_ROOT, 'scripts', 'doctor.mjs'), '--home', layout.home, '--json'], {
       cwd: REPO_ROOT,
-      env: { ...process.env, DSH_VERSION: DSH_VERSION },
+      env: { ...scratchEnv(layout.home), DSH_VERSION },
     }),
     (error) => {
       assert.equal(error.code, 1)
@@ -218,4 +226,114 @@ test('doctor CLI prints JSON and exits 1 when checks fail', async (t) => {
       return true
     },
   )
+})
+
+test('doctor CLI uses DSH_HOME for the plugin root and succeeds', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-home-e2e-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dshHome = join(root, 'custom-dsh')
+  const env = scratchEnv(root, dshHome)
+
+  await run(process.execPath, [INSTALL], { cwd: REPO_ROOT, env })
+  await writeFile(join(dshHome, 'version'), `${DSH_VERSION}\n`)
+
+  const driver = join(root, process.platform === 'win32' ? 'cua-driver.exe' : 'cua-driver')
+  await writeFile(driver, 'fake driver')
+
+  const { stdout } = await run(process.execPath, [join(REPO_ROOT, 'scripts', 'doctor.mjs'), '--json'], {
+    cwd: REPO_ROOT,
+    env: { ...env, CUA_DRIVER_BIN: driver },
+  })
+
+  const parsed = JSON.parse(stdout)
+  assert.equal(parsed.ok, true)
+  const checks = checksByName(parsed)
+  assert.equal(checks['plugin-install'].ok, true)
+  assert.ok(checks['plugin-install'].detail.includes(dshHome))
+  assert.match(checks['dsh-version'].detail, new RegExp(DSH_VERSION))
+})
+
+test('doctor version detection: DSH_VERSION beats package files and dsh', async () => {
+  const calls = []
+  const version = await detectDshVersion({
+    dshHome: join(tmpdir(), 'unused-dsh-home'),
+    env: { DSH_VERSION: '0.2.2', DSH_APP_PACKAGE_JSON: 'ignored.json' },
+    readFile: async () => JSON.stringify({ version: '9.9.9' }),
+    execFile: async () => {
+      calls.push('exec')
+      return { stdout: '9.9.9' }
+    },
+  })
+
+  assert.equal(version, '0.2.2')
+  assert.deepEqual(calls, [])
+})
+
+test('doctor version detection reads DSH_APP_PACKAGE_JSON', async () => {
+  const version = await detectDshVersion({
+    env: { DSH_APP_PACKAGE_JSON: 'C:/app/package.json' },
+    readFile: async () => JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.1-rc.2' }),
+    execFile: async () => {
+      throw new Error('dsh should not run')
+    },
+  })
+
+  assert.equal(version, '0.2.1-rc.2')
+})
+
+test('doctor version detection reads the desktop resources package.json', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-version-app-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const packageJson = join(root, 'resources', 'app', 'package.json')
+  await mkdir(dirname(packageJson), { recursive: true })
+  await writeFile(packageJson, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.1' }))
+
+  const version = await detectDshVersion({
+    dshHome: join(root, '.dsh'),
+    env: {},
+    execFile: async () => {
+      throw new Error('dsh should not run')
+    },
+  })
+
+  assert.equal(version, '0.2.1')
+})
+
+test('doctor version detection reads <dshHome>/version before PATH dsh', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-version-file-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dshHome = join(root, '.dsh')
+  await mkdir(dshHome, { recursive: true })
+  await writeFile(join(dshHome, 'version'), `${DSH_VERSION}\n`)
+
+  let execCalled = false
+  const version = await detectDshVersion({
+    dshHome,
+    env: {},
+    execFile: async () => {
+      execCalled = true
+      return '0.3.0'
+    },
+  })
+
+  assert.equal(version, DSH_VERSION)
+  assert.equal(execCalled, false)
+})
+
+test('doctor version detection launches dsh through cmd.exe on win32', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-version-exec-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dshHome = join(root, '.dsh')
+  const calls = []
+  const execFile = async (file, args) => {
+    calls.push([file, args])
+    return { stdout: 'DeepSeek Harness 0.2.2\n' }
+  }
+
+  assert.equal(await detectDshVersion({ dshHome, env: {}, execFile, platform: 'win32' }), '0.2.2')
+  assert.deepEqual(calls, [['cmd.exe', ['/d', '/s', '/c', 'dsh --version']]])
+
+  calls.length = 0
+  assert.equal(await detectDshVersion({ dshHome, env: {}, execFile, platform: 'linux' }), '0.2.2')
+  assert.deepEqual(calls, [['dsh', ['--version']]])
 })

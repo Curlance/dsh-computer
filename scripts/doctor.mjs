@@ -2,7 +2,8 @@
 /**
  * `dsh-computer` doctor: verify a DSH install without starting the desktop.
  *
- * Checks (each returns `{name, ok, detail}`, never throws):
+ * Checks each return `{name, ok, detail}`. A missing or broken install becomes a
+ * failed check instead of a throw; unexpected filesystem errors still reject.
  *   - dsh-version     the DSH runtime version can be detected
  *   - dsh-compat      the detected DSH satisfies `lib/compat.js`'s requirement
  *   - cua-driver      an injected backend answers, or the driver executable exists
@@ -20,17 +21,15 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs, promisify } from 'node:util'
 
-import { DSH_REQUIREMENT, detectDshVersion } from '../lib/compat.js'
+import { DSH_REQUIREMENT } from '../lib/compat.js'
 import { resolveDriverCommand } from '../lib/host.js'
-import { satisfiesRange } from '../lib/install/version.js'
+import { MANAGED_BEGIN_RE, MANAGED_END_RE, ROW_ID_RE } from '../lib/install/patch.js'
+import { parseVersion, satisfiesRange } from '../lib/install/version.js'
 
 const PACKAGE_NAME = 'dsh-computer'
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const DEFAULT_PROFILE = 'desktop'
-
-const BEGIN_MARKER = /^#\s*>>>\s*dsh-computer\s+\(managed[^)]*\)$/
-const END_MARKER = /^#\s*<<<\s*dsh-computer$/
-const ROOT_ROW_ID = /^\s*(?:-\s+)?id:\s*(['"]?)dsh-computer\1\s*(?:#.*)?$/
+const VERSION_RE = /\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/
 
 const USAGE = `Usage: node scripts/doctor.mjs [options]
 
@@ -42,60 +41,182 @@ Options:
   -h, --help        Show this help
 `
 
-const execAsync = promisify(execFile)
-const defaultExec = async (command) => {
-  const [file, ...args] = command.split(/\s+/)
-  const { stdout } = await execAsync(file, args, { timeout: 5000, windowsHide: true })
+const execFileAsync = promisify(execFile)
+const defaultReadText = (path) => readFile(path, 'utf8')
+const defaultExecFile = async (file, args) => {
+  const { stdout } = await execFileAsync(file, args, { timeout: 5000, windowsHide: true })
   return stdout
 }
 
 /**
- * Inspect the DSH install rooted at `home`.
+ * Detect the DSH runtime version. Priority (first valid version wins):
+ *   1. env `DSH_VERSION`
+ *   2. `env.DSH_APP_PACKAGE_JSON` (explicit package.json for packaged/dev hosts)
+ *   3. known install files relative to the DSH home:
+ *      `<install-root>/resources/app/package.json` (unpacked desktop),
+ *      `<install-root>/package.json` (portable/dev install),
+ *      `<dshHome>/version` (version sentinel)
+ *   4. `dsh --version` from PATH; on win32 through
+ *      `cmd.exe /d /s /c "dsh --version"` so the `.cmd` shim can launch
+ *   5. null when nothing is detectable
+ *
+ * `readFile` and `execFile` are injectable so the order can be tested without a
+ * real DSH install.
+ *
+ * @param {{dshHome?: string, env?: Record<string, string | undefined>,
+ *          readFile?: (path: string) => Promise<string> | string,
+ *          execFile?: (file: string, args: string[]) => Promise<any>,
+ *          platform?: string}} [options]
+ * @returns {Promise<string|null>}
+ */
+export async function detectDshVersion({
+  dshHome,
+  env = process.env,
+  readFile: readText = defaultReadText,
+  execFile: runExecFile = defaultExecFile,
+  platform = process.platform,
+} = {}) {
+  const fromEnv = normaliseVersion(env?.DSH_VERSION)
+  if (fromEnv !== null) return fromEnv
+
+  const explicitPackage = env?.DSH_APP_PACKAGE_JSON
+  if (typeof explicitPackage === 'string' && explicitPackage.length > 0) {
+    const fromPackage = await readPackageVersion(explicitPackage, readText)
+    if (fromPackage !== null) return fromPackage
+  }
+
+  if (typeof dshHome === 'string' && dshHome.length > 0) {
+    const installRoot = dirname(resolve(dshHome))
+    for (const candidate of [
+      join(installRoot, 'resources', 'app', 'package.json'),
+      join(installRoot, 'package.json'),
+    ]) {
+      const fromPackage = await readPackageVersion(candidate, readText)
+      if (fromPackage !== null) return fromPackage
+    }
+    const fromVersionFile = await readVersionFile(join(dshHome, 'version'), readText)
+    if (fromVersionFile !== null) return fromVersionFile
+  }
+
+  try {
+    const output =
+      platform === 'win32'
+        ? await runExecFile('cmd.exe', ['/d', '/s', '/c', 'dsh --version'])
+        : await runExecFile('dsh', ['--version'])
+    const text = typeof output === 'string' ? output : output?.stdout
+    const fromExec = normaliseVersion(String(text ?? '').match(VERSION_RE)?.[0])
+    if (fromExec !== null) return fromExec
+  } catch {
+    // dsh is not on PATH or has no --version: version stays unknown
+  }
+
+  return null
+}
+
+async function readPackageVersion(path, readText) {
+  try {
+    const manifest = JSON.parse(await readText(path))
+    return normaliseVersion(manifest?.version)
+  } catch {
+    return null
+  }
+}
+
+async function readVersionFile(path, readText) {
+  try {
+    const text = String(await readText(path)).trim()
+    const value = text.startsWith('{') ? JSON.parse(text)?.version : text.match(VERSION_RE)?.[0]
+    return normaliseVersion(value)
+  } catch {
+    return null
+  }
+}
+
+function normaliseVersion(value) {
+  if (typeof value !== 'string') return null
+  const candidate = value.trim().replace(/^v/, '')
+  return parseVersion(candidate) ? candidate : null
+}
+
+/**
+ * Inspect the DSH install rooted at `dshHome` (or at `<home>/.dsh`, or
+ * `$DSH_HOME`, matching `scripts/install.mjs`).
  *
  * @param {{
  *   home?: string,
+ *   dshHome?: string,
  *   profileDir?: string,
  *   backend?: {doctor?: () => any, ping?: () => any},
  *   patchPath?: string,
  *   env?: Record<string, string | undefined>,
  *   readFile?: (path: string) => Promise<string> | string,
- *   exec?: (command: string) => Promise<string> | string,
+ *   execFile?: (file: string, args: string[]) => Promise<any>,
  *   exists?: (path: string) => boolean,
  * }} [options]
  * @returns {Promise<{ok: boolean, checks: Array<{name: string, ok: boolean, detail: string}>}>}
  */
 export async function doctor({
   home,
+  dshHome,
   profileDir,
   backend,
   patchPath,
   env = process.env,
   readFile: readFileOption,
-  exec = defaultExec,
+  execFile: runExecFile,
   exists = existsSync,
 } = {}) {
-  const userHome = home === undefined ? homedir() : resolve(home)
-  const dshHome = join(userHome, '.dsh')
-  const profile = profileDir === undefined ? join(dshHome, 'profiles', DEFAULT_PROFILE) : resolve(profileDir)
-  const resolvedPatchPath = patchPath === undefined ? join(dshHome, 'cordis.patch.yml') : resolve(patchPath)
-  const readText = readFileOption ?? ((path) => readFile(path, 'utf8'))
+  const resolvedDshHome = resolveDshHome({ dshHome, home, patchPath, profileDir, env })
+  const userHome = resolveUserHome({ home, dshHome, env })
+  const profile = profileDir === undefined ? join(resolvedDshHome, 'profiles', DEFAULT_PROFILE) : resolve(profileDir)
+  const resolvedPatchPath =
+    patchPath === undefined ? join(resolvedDshHome, 'cordis.patch.yml') : resolve(patchPath)
 
-  const version = await detectDshVersion({ env, readFile: readText, exec })
+  const version = await detectDshVersion({
+    dshHome: resolvedDshHome,
+    env,
+    readFile: readFileOption ?? defaultReadText,
+    ...(runExecFile === undefined ? {} : { execFile: runExecFile }),
+  })
   const manifest = await readManifest()
   const checks = [
     versionCheck(version),
     compatCheck(version),
     await driverCheck({ backend, home: userHome, env, exists }),
     await patchCheck(resolvedPatchPath),
-    await pluginCheck({ dshHome, profile, manifest }),
+    await pluginCheck({ dshHome: resolvedDshHome, profile, manifest }),
   ]
 
   return { ok: checks.every((check) => check.ok), checks }
 }
 
+/**
+ * Mirror `scripts/install.mjs`: explicit DSH home wins, then `<home>/.dsh`, then
+ * paths derived from the injected patch/profile, then `$DSH_HOME`, then `~/.dsh`.
+ */
+function resolveDshHome({ dshHome, home, patchPath, profileDir, env }) {
+  if (dshHome !== undefined) return resolve(dshHome)
+  if (home !== undefined) return join(resolve(home), '.dsh')
+  if (patchPath !== undefined) return dirname(resolve(patchPath))
+  if (profileDir !== undefined) return dirname(dirname(resolve(profileDir)))
+  if (typeof env?.DSH_HOME === 'string' && env.DSH_HOME.length > 0) return resolve(env.DSH_HOME)
+  return join(homedir(), '.dsh')
+}
+
+function resolveUserHome({ home, dshHome, env }) {
+  if (home !== undefined) return resolve(home)
+  if (dshHome !== undefined) return dirname(resolve(dshHome))
+  if (typeof env?.DSH_HOME === 'string' && env.DSH_HOME.length > 0) return dirname(resolve(env.DSH_HOME))
+  return homedir()
+}
+
 function versionCheck(version) {
   return version === null
-    ? check('dsh-version', false, "DSH runtime not detected; set DSH_VERSION or run 'dsh --version'")
+    ? check(
+        'dsh-version',
+        false,
+        "DSH runtime not detected; set DSH_VERSION or DSH_APP_PACKAGE_JSON, add <dsh-home>/version, or run 'dsh --version'",
+      )
     : check('dsh-version', true, `detected DSH ${version}`)
 }
 
@@ -162,10 +283,10 @@ function hasManagedRow(text) {
   for (const line of lines) {
     const trimmed = line.trim()
     if (!inside) {
-      if (BEGIN_MARKER.test(trimmed)) inside = true
-    } else if (END_MARKER.test(trimmed)) {
+      if (MANAGED_BEGIN_RE.test(trimmed)) inside = true
+    } else if (MANAGED_END_RE.test(trimmed)) {
       return found
-    } else if (ROOT_ROW_ID.test(line)) {
+    } else if (line.match(ROW_ID_RE)?.[2] === PACKAGE_NAME) {
       found = true
     }
   }
@@ -251,6 +372,7 @@ async function main(argv = process.argv.slice(2)) {
       : join(home, '.dsh')
   const result = await doctor({
     ...(home === undefined ? {} : { home }),
+    dshHome,
     profileDir: join(dshHome, 'profiles', values.profile),
     patchPath: join(dshHome, 'cordis.patch.yml'),
   })
