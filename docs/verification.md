@@ -445,3 +445,94 @@ npm pack --dry-run --json
   copy and restored the custom `SKILL.md`.
 - Relative-link check over README, CHANGELOG, `docs/**` and `skills/**`: no
   broken links. `git show --check`: no whitespace errors.
+
+## Final-review Critical #3 — updater/installer plugin layout (2026-10-22)
+
+### Changes
+
+- `lib/update/install.js` installs into `plugins/dsh-computer/<version>` (the
+  installer layout), creates the package parent, extracts into
+  `plugins/dsh-computer/.tmp-*` and renames atomically. `switchCurrent` targets
+  the nested version dir; `previous.json` paths are nested. Existing identical
+  installs are reused, mismatched identities are still refused, and link targets
+  in the legacy flat layout are recognized for rollback.
+- `scripts/doctor.mjs` verifies the profile link against either layout: nested
+  `plugins/dsh-computer/<version>` or legacy flat
+  `plugins/dsh-computer-<version>`. A flat install reports ok with a migration
+  note; a missing/stale link still fails with an `install.mjs` hint.
+- `scripts/uninstall.mjs` removes the nested `plugins/dsh-computer/` tree and
+  every legacy flat `plugins/dsh-computer-*` directory (including orphaned ones
+  from old updater runs) while keeping unrelated plugin dirs.
+- `scripts/update.mjs` documentation now states the nested destination.
+- Tests cover nested installs, the overwrite refusal, nested `previous.json`
+  paths, legacy-flat previous installs on switch/rollback, doctor after an
+  updater-nested install with no downgrade, and uninstall of nested + flat dirs.
+
+### Commands and results
+
+```powershell
+node --check lib/update/install.js
+node --check scripts/update.mjs
+node --check scripts/doctor.mjs
+node --check scripts/uninstall.mjs
+node --check tests/update.test.mjs
+node --check tests/install-e2e.test.mjs
+node --test tests/update.test.mjs
+node --test tests/install-e2e.test.mjs
+npm test
+```
+
+- all six `node --check` runs passed.
+- update tests: **39/39 pass**.
+- install e2e: **20/20 pass**.
+- full suite: **411 tests, 410 pass, 1 skipped, 0 fail** (~4.7 s).
+- Committed as `6c71d94 fix: unify updater plugin layout`.
+
+## Final-review Critical #2 and Important #6/#7/#8 — act timeout, cancellation and safety gates (2026-10-22)
+
+### Changes
+
+- `lib/backend/mcp.js`: `McpError` now carries a machine-readable `code`
+  (`mcp_error` by default); `TimeoutError` sets `code: 'timeout'`.
+- `lib/backend/cua.js`: `ToolCallError` copies its cause's code (so the real
+  driver timeout is `code: 'timeout'`) and keeps `cause`.
+- `lib/act.js`: `classifyEffect` treats an error as unverifiable when
+  `error.code === 'timeout'`, `error.cause.code === 'timeout'`, or the
+  message/cause message matches `timeout`/`timed out`; the matching advice is
+  `结果未知，先重新 observe 再决定是否重试` and the outcome is never refused.
+- `lib/act.js`: an already-resolved element with a password-ish role/type, or an
+  editable role labelled `Password`, is refused as `password-field` before any
+  backend call.
+- `lib/act.js`: a `confirmed` action whose readback returns
+  `verification.observed === false` is downgraded to `unverifiable` with advice
+  while keeping the verification detail.
+- `lib/act.js` / `lib/tool.js`: `exec.signal` (or `args.signal`) reaches act
+  execution and the observe `waitFor`; an aborted signal returns
+  `refused (cancelled)` before the backend action or before the next waitFor
+  poll. Signal-aware waitFor polls through a checked observer proxy, and the
+  signal is also passed to `policy.authorize` for hosts that forward
+  cancellation to approval.
+- `lib/tool.js`: per-step authorization now runs
+  `control.assertAgentAllowed()` before `policy.authorize()`, so a control
+  denial raises no approval request and consumes no policy rate budget.
+- Tests cover timeout classification at act/mcp/cua levels, cancellation before
+  and during waitFor, resolved password fields, readback downgrade, and the
+  control-before-policy order.
+
+### Commands and results
+
+```powershell
+node --check lib/act.js
+node --check lib/tool.js
+node --check lib/backend/mcp.js
+node --check lib/backend/cua.js
+node --test tests/act.test.mjs tests/tool.test.mjs tests/mcp.test.mjs tests/cua-backend.test.mjs
+node --test tests/*.test.mjs
+```
+
+- all four `node --check` runs passed.
+- focused suites: **133 tests, 132 pass, 1 skipped, 0 fail**.
+- full suite: **420 tests, 419 pass, 1 skipped, 0 fail** (~4.2 s).
+- Committed as `8dd1959 fix: act timeout cancellation and safety gates`.
+
+
