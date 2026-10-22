@@ -283,6 +283,28 @@ test('toLocalPoint maps physical screen frames into screenshot pixels', () => {
   assert.deepEqual(toLocalPoint({ x: 100, y: 50 }, observation), { x: 0, y: 0 })
   assert.throws(() => toLocalPoint({ y: 1 }, observation), /frame/)
   assert.throws(() => toLocalPoint({ x: 1, y: 1 }, null), /observation/)
+  assert.throws(
+    () =>
+      toLocalPoint(
+        { x: 1, y: 1 },
+        {
+          bounds: { x: Number.NaN, y: 0, width: 100, height: 100 },
+          space: { width: 50, height: 50 },
+        },
+      ),
+    /bounds/,
+  )
+  assert.throws(
+    () =>
+      toLocalPoint(
+        { x: 1, y: 1 },
+        {
+          bounds: { x: 0, y: 0, width: 100, height: 100 },
+          space: { width: 0, height: 50 },
+        },
+      ),
+    /space/,
+  )
 })
 
 test('tree mode requests no screenshot and derives the space from maxImageDimension', async () => {
@@ -399,6 +421,83 @@ test('active target with no on-screen window throws a readable error', async () 
   const observer = createObserverWith(backend)
 
   await assert.rejects(observer.observe({ kind: 'active' }), /active window/)
+})
+
+test('active target throws when no on-screen window reports z_index or a foreground flag', async () => {
+  const windows = [
+    { pid: 1, window_id: 1, title: 'First', bounds: BOUNDS, is_on_screen: true },
+    { pid: 2, window_id: 2, title: 'Second', bounds: BOUNDS, is_on_screen: true },
+  ]
+  const backend = createFakeBackend({ windows })
+  const observer = createObserverWith(backend)
+
+  await assert.rejects(
+    observer.observe({ kind: 'active' }, { mode: 'tree' }),
+    /无法确定活动窗口：请显式传 pid\/windowId（或先 bring_to_front）/,
+  )
+  assert.equal(backend.calls.some((call) => call.name === 'get_window_state'), false)
+})
+
+test('active target prefers an on-screen foreground window over a higher z_index', async () => {
+  const windows = [
+    { pid: 1, window_id: 1, title: 'Stacked higher', bounds: BOUNDS, is_on_screen: true, z_index: 9 },
+    {
+      pid: 2,
+      window_id: 2,
+      title: 'Focused',
+      bounds: BOUNDS,
+      is_on_screen: true,
+      z_index: 2,
+      is_foreground: true,
+    },
+  ]
+  const backend = createFakeBackend({
+    windows,
+    getWindowState: (args) =>
+      windowStateResult({ pid: args.pid, windowId: args.windowId, title: 'Focused', includeScreenshot: false }),
+  })
+  const observer = createObserverWith(backend)
+
+  const observation = await observer.observe({ kind: 'active' }, { mode: 'tree' })
+
+  assert.equal(observation.pid, 2)
+  assert.equal(observation.windowId, 2)
+})
+
+test('active target ignores minimized or off-screen foreground windows', async () => {
+  const windows = [
+    {
+      pid: 1,
+      window_id: 1,
+      title: 'Minimized foreground',
+      bounds: BOUNDS,
+      is_on_screen: true,
+      minimized: true,
+      is_foreground: true,
+      z_index: 100,
+    },
+    {
+      pid: 3,
+      window_id: 3,
+      title: 'Off-screen foreground',
+      bounds: BOUNDS,
+      is_on_screen: false,
+      is_foreground: true,
+      z_index: 100,
+    },
+    { pid: 2, window_id: 2, title: 'Visible', bounds: BOUNDS, is_on_screen: true, z_index: 5 },
+  ]
+  const backend = createFakeBackend({
+    windows,
+    getWindowState: (args) =>
+      windowStateResult({ pid: args.pid, windowId: args.windowId, title: 'Visible', includeScreenshot: false }),
+  })
+  const observer = createObserverWith(backend)
+
+  const observation = await observer.observe({ kind: 'active' }, { mode: 'tree' })
+
+  assert.equal(observation.pid, 2)
+  assert.equal(observation.windowId, 2)
 })
 
 test('screen target uses desktop bounds and the desktop screenshot space', async () => {
@@ -674,6 +773,14 @@ test('waitFor supports element_exists and element_enabled', async () => {
     timeoutMs: 20,
   })
   assert.equal(disabled.matched, false)
+
+  const missingEnabled = cloneElements(BASE_ELEMENTS)
+  delete missingEnabled[1].enabled
+  const unknown = await waitForFixture(
+    { condition: 'element_enabled', text: 'Save', timeoutMs: 20 },
+    { elements: missingEnabled },
+  )
+  assert.equal(unknown.matched, false)
 })
 
 test('waitFor supports focused_element', async () => {
@@ -711,4 +818,85 @@ test('observe can wait internally and reports the wait result', async () => {
 
   assert.equal(observation.waitFor.matched, true)
   assert.ok(observation.tree.some((element) => element.label === 'Done'))
+})
+
+test('observe with waitFor returns a final observation with the caller options', async () => {
+  let calls = 0
+  const backend = createFakeBackend({
+    getWindowState: (args) => {
+      calls += 1
+      const elements = calls >= 2 ? [...BASE_ELEMENTS, DONE_ELEMENT] : BASE_ELEMENTS
+      return windowStateResult({
+        elements: args.query !== undefined ? projectQuery(elements, args.query) : elements,
+        includeScreenshot: args.includeScreenshot !== false,
+      })
+    },
+  })
+  const observer = createObserverWith(backend)
+
+  const observation = await observer.observe(WINDOW_TARGET, {
+    mode: 'both',
+    waitFor: { condition: 'text_exists', text: 'Done', timeoutMs: 500, intervalMs: 20 },
+  })
+
+  assert.equal(observation.waitFor.matched, true)
+  assert.deepEqual(observation.screenshotPng, PNG)
+  assert.equal(backend.calls[0].args.includeScreenshot, true)
+  assert.equal(backend.calls.at(-1).args.includeScreenshot, true)
+  assert.ok(backend.calls.slice(1, -1).some((call) => call.args.includeScreenshot === false))
+  assert.equal(backend.calls.at(-1).args.query, undefined)
+})
+
+test('observe with waitFor forwards query on the initial, poll and final observations', async () => {
+  let calls = 0
+  const backend = createFakeBackend({
+    getWindowState: (args) => {
+      calls += 1
+      const elements = calls >= 3 ? [...BASE_ELEMENTS, DONE_ELEMENT] : BASE_ELEMENTS
+      return windowStateResult({
+        elements: args.query !== undefined ? projectQuery(elements, args.query) : elements,
+        includeScreenshot: args.includeScreenshot !== false,
+      })
+    },
+  })
+  const observer = createObserverWith(backend)
+
+  const observation = await observer.observe(WINDOW_TARGET, {
+    mode: 'both',
+    query: 'done',
+    waitFor: { condition: 'text_exists', text: 'Done', timeoutMs: 500, intervalMs: 20 },
+  })
+
+  assert.equal(observation.waitFor.matched, true)
+  assert.ok(backend.calls.every((call) => call.args.query === 'done'))
+  assert.equal(backend.calls[0].args.includeScreenshot, true)
+  assert.equal(backend.calls.at(-1).args.includeScreenshot, true)
+  assert.ok(backend.calls.slice(1, -1).some((call) => call.args.includeScreenshot === false))
+  assert.deepEqual(
+    observation.tree.map((element) => element.label),
+    [TITLE, 'Done'],
+  )
+  assert.deepEqual(observation.screenshotPng, PNG)
+})
+
+test('observe with an already-matched waitFor condition does not poll', async () => {
+  const backend = createFakeBackend()
+  const observer = createObserverWith(backend)
+
+  const observation = await observer.observe(WINDOW_TARGET, {
+    mode: 'both',
+    query: 'save',
+    waitFor: { condition: 'text_exists', text: 'Save', timeoutMs: 500, intervalMs: 20 },
+  })
+
+  assert.equal(backend.calls.length, 1)
+  assert.equal(backend.calls[0].args.includeScreenshot, true)
+  assert.equal(backend.calls[0].args.query, 'save')
+  assert.equal(observation.waitFor.matched, true)
+  assert.equal(typeof observation.waitFor.elapsedMs, 'number')
+  assert.deepEqual(observation.screenshotPng, PNG)
+  assert.deepEqual(
+    observation.tree.map((element) => element.label),
+    [TITLE, 'Save'],
+  )
 })
