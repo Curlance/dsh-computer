@@ -253,6 +253,32 @@ test('doctor CLI uses DSH_HOME for the plugin root and succeeds', async (t) => {
   assert.match(checks['dsh-version'].detail, new RegExp(DSH_VERSION))
 })
 
+test('doctor CLI looks for the driver in the real home when DSH_HOME is nested', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-home-nested-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dshHome = join(root, 'nested', 'custom-dsh')
+  const env = { ...scratchEnv(root, dshHome), PATH: '' }
+
+  await run(process.execPath, [INSTALL], { cwd: REPO_ROOT, env })
+  await writeFile(join(dshHome, 'version'), `${DSH_VERSION}\n`)
+
+  // dirname(DSH_HOME) is `<root>/nested`; the driver lives in the user's home.
+  const driverDir = join(root, 'AppData', 'Local', 'cua-driver')
+  await mkdir(driverDir, { recursive: true })
+  await writeFile(join(driverDir, process.platform === 'win32' ? 'cua-driver.exe' : 'cua-driver'), 'fake driver')
+
+  const { stdout } = await run(process.execPath, [join(REPO_ROOT, 'scripts', 'doctor.mjs'), '--json'], {
+    cwd: REPO_ROOT,
+    env,
+  })
+
+  const parsed = JSON.parse(stdout)
+  assert.equal(parsed.ok, true)
+  const driver = checksByName(parsed)['cua-driver']
+  assert.equal(driver.ok, true)
+  assert.ok(driver.detail.includes(driverDir), `unexpected driver detail: ${driver.detail}`)
+})
+
 test('doctor version detection: DSH_VERSION beats package files and dsh', async () => {
   const calls = []
   const version = await detectDshVersion({
@@ -318,6 +344,78 @@ test('doctor version detection reads <dshHome>/version before PATH dsh', async (
 
   assert.equal(version, DSH_VERSION)
   assert.equal(execCalled, false)
+})
+
+test('doctor version detection ignores a stray <home>/package.json when <dshHome>/version exists', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-version-stray-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dshHome = join(root, '.dsh')
+  await mkdir(dshHome, { recursive: true })
+  // An unrelated user project manifest must not override the DSH sentinel.
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'stray-app', version: '1.0.0' }))
+  await writeFile(join(dshHome, 'version'), `${DSH_VERSION}\n`)
+
+  const version = await detectDshVersion({
+    dshHome,
+    env: {},
+    execFile: async () => {
+      throw new Error('dsh should not run')
+    },
+  })
+
+  assert.equal(version, DSH_VERSION)
+})
+
+test('doctor version detection accepts install-root package.json only with a DSH name', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-version-name-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dshHome = join(root, '.dsh')
+  const manifest = join(root, 'package.json')
+  const execFile = async () => {
+    throw new Error('dsh should not run')
+  }
+  const detect = () => detectDshVersion({ dshHome, env: {}, execFile })
+
+  await writeFile(manifest, JSON.stringify({ name: 'stray-app', version: '1.0.0' }))
+  assert.equal(await detect(), null)
+
+  await writeFile(manifest, JSON.stringify({ version: '1.0.0' }))
+  assert.equal(await detect(), null, 'a nameless manifest is not trusted')
+
+  await writeFile(manifest, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.1' }))
+  assert.equal(await detect(), '0.2.1')
+
+  await writeFile(manifest, JSON.stringify({ name: '@deepseek-ai/dsh-desktop', version: '0.2.1-rc.2' }))
+  assert.equal(await detect(), '0.2.1-rc.2')
+
+  await writeFile(manifest, JSON.stringify({ name: 'deepseek-harness', version: '0.2.2' }))
+  assert.equal(await detect(), '0.2.2')
+})
+
+test('doctor version detection prefers <dshHome>/version over DSH package manifests', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-version-priority-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const dshHome = join(root, '.dsh')
+  await mkdir(dshHome, { recursive: true })
+  await mkdir(join(root, 'resources', 'app'), { recursive: true })
+  // Both manifests carry a valid DSH name and a newer version: the sentinel
+  // still identifies the installed runtime.
+  await writeFile(
+    join(root, 'resources', 'app', 'package.json'),
+    JSON.stringify({ name: '@deepseek-ai/dsh-desktop', version: '9.9.8' }),
+  )
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '9.9.9' }))
+  await writeFile(join(dshHome, 'version'), `${DSH_VERSION}\n`)
+
+  const version = await detectDshVersion({
+    dshHome,
+    env: {},
+    execFile: async () => {
+      throw new Error('dsh should not run')
+    },
+  })
+
+  assert.equal(version, DSH_VERSION)
 })
 
 test('doctor version detection launches dsh through cmd.exe on win32', async (t) => {

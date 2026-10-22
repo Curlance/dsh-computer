@@ -30,6 +30,9 @@ const PACKAGE_NAME = 'dsh-computer'
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const DEFAULT_PROFILE = 'desktop'
 const VERSION_RE = /\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/
+// A manifest is only trusted as DSH's own: `@deepseek-ai/dsh*` or any
+// deepseek+harness package name. Generic `<home>/package.json` must not win.
+const DSH_PACKAGE_RE = /^@deepseek-ai\/dsh(?:-[a-z0-9.-]+)?$/
 
 const USAGE = `Usage: node scripts/doctor.mjs [options]
 
@@ -53,9 +56,11 @@ const defaultExecFile = async (file, args) => {
  *   1. env `DSH_VERSION`
  *   2. `env.DSH_APP_PACKAGE_JSON` (explicit package.json for packaged/dev hosts)
  *   3. known install files relative to the DSH home:
+ *      `<dshHome>/version` (version sentinel),
  *      `<install-root>/resources/app/package.json` (unpacked desktop),
- *      `<install-root>/package.json` (portable/dev install),
- *      `<dshHome>/version` (version sentinel)
+ *      `<install-root>/package.json` (portable/dev install).
+ *      Package manifests are only accepted when `name` is a DSH package name,
+ *      so an unrelated `<home>/package.json` is ignored.
  *   4. `dsh --version` from PATH; on win32 through
  *      `cmd.exe /d /s /c "dsh --version"` so the `.cmd` shim can launch
  *   5. null when nothing is detectable
@@ -86,16 +91,17 @@ export async function detectDshVersion({
   }
 
   if (typeof dshHome === 'string' && dshHome.length > 0) {
+    const fromVersionFile = await readVersionFile(join(dshHome, 'version'), readText)
+    if (fromVersionFile !== null) return fromVersionFile
+
     const installRoot = dirname(resolve(dshHome))
     for (const candidate of [
       join(installRoot, 'resources', 'app', 'package.json'),
       join(installRoot, 'package.json'),
     ]) {
-      const fromPackage = await readPackageVersion(candidate, readText)
+      const fromPackage = await readPackageVersion(candidate, readText, { requireDshName: true })
       if (fromPackage !== null) return fromPackage
     }
-    const fromVersionFile = await readVersionFile(join(dshHome, 'version'), readText)
-    if (fromVersionFile !== null) return fromVersionFile
   }
 
   try {
@@ -113,13 +119,20 @@ export async function detectDshVersion({
   return null
 }
 
-async function readPackageVersion(path, readText) {
+async function readPackageVersion(path, readText, { requireDshName = false } = {}) {
   try {
     const manifest = JSON.parse(await readText(path))
+    if (requireDshName && !isDshManifestName(manifest?.name)) return null
     return normaliseVersion(manifest?.version)
   } catch {
     return null
   }
+}
+
+function isDshManifestName(name) {
+  if (typeof name !== 'string') return false
+  const value = name.trim().toLowerCase()
+  return DSH_PACKAGE_RE.test(value) || (value.includes('deepseek') && value.includes('harness'))
 }
 
 async function readVersionFile(path, readText) {
@@ -203,8 +216,16 @@ function resolveDshHome({ dshHome, home, patchPath, profileDir, env }) {
   return join(homedir(), '.dsh')
 }
 
+/**
+ * Driver defaults resolve against the real user home. A custom `DSH_HOME` can
+ * live anywhere (e.g. `<home>/nested/custom-dsh`), so its parent is only a last
+ * resort when neither `USERPROFILE` nor `HOME` is available.
+ */
 function resolveUserHome({ home, dshHome, env }) {
   if (home !== undefined) return resolve(home)
+  for (const candidate of [env?.USERPROFILE, env?.HOME]) {
+    if (typeof candidate === 'string' && candidate.length > 0) return resolve(candidate)
+  }
   if (dshHome !== undefined) return dirname(resolve(dshHome))
   if (typeof env?.DSH_HOME === 'string' && env.DSH_HOME.length > 0) return dirname(resolve(env.DSH_HOME))
   return homedir()
