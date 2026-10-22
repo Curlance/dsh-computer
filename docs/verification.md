@@ -536,3 +536,17 @@ node --test tests/*.test.mjs
 - Committed as `8dd1959 fix: act timeout cancellation and safety gates`.
 
 
+
+## Real DSH install — 2026-10-22 20:31 (Asia/Shanghai)
+
+Installed into the live desktop profile with `node scripts/install.mjs --home C:\Users\b1778 --profile desktop`:
+
+- `plugins/dsh-computer/0.1.0` copied; `profiles/desktop/node_modules/dsh-computer` linked to it.
+- Legacy `dsh-computer-use-0.4.0/0.4.1` moved to `plugins/_backup/`; patch backed up before edit.
+- Managed root row written to `~/.dsh/cordis.patch.yml` (`# >>> dsh-computer (managed)` block).
+- `skills/computer-use` replaced (previous skill backed up under `~/.dsh/computer/backup/skills-*`).
+- `node scripts/doctor.mjs --home C:\Users\b1778 --profile desktop`: all 5 checks ok (DSH 0.2.1-rc.2 detected from the running app's file version; driver found; patch row present; link resolves).
+- The running DSH desktop session hot-reloaded the plugin: the harness published the compiled `computer` tool schema (action observe/act/session, DSL parameters) without a restart.
+- Headless standard-session check was attempted (`dsh headless "..."`); it cannot run here because the headless profile has no `DEEPSEEK_API_KEY` configured and no per-profile plugin link. The desktop session itself is the verified host-load path; approval-UI behaviour still needs a manual interactive check.
+
+Known limitation: `doctor` version detection uses `DSH_VERSION`, `DSH_APP_PACKAGE_JSON`, `<dshHome>/version`, DSH manifests, `dsh --version`, then the running `DeepSeek Harness.exe` FileVersion; a stopped app with no PATH shim and no version file still reports unknown.
