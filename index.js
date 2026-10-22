@@ -1,8 +1,12 @@
 import z from '@deepseek-ai/schemastery'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 
-import { APPROVAL_MODES, DEFAULT_CONFIG } from './lib/config.js'
+import { APPROVAL_MODES, DEFAULT_CONFIG, normalizeConfig } from './lib/config.js'
+import { register } from './lib/host.js'
 
 export const name = 'dsh-computer'
+
+export const inject = ['tools', 'approval']
 
 /**
  * Plugin config schema exposed to DSH.
@@ -38,5 +42,16 @@ export const Config = z.object({
   }),
 })
 
-/** Register the plugin. Tool wiring lands in a later task. */
-export function apply(_ctx, _config) {}
+/** Register the plugin: one `computer` tool with a lazily started cua backend. */
+export function apply(ctx, config) {
+  const cfg = normalizeConfig(config ?? {})
+  const plugin = register(ctx, cfg, { defineTool })
+  if (typeof ctx.on === 'function') {
+    ctx.on('dispose', () => {
+      void plugin.dispose()
+    })
+  }
+  ctx.logger?.info?.('dsh-computer: computer 工具已注册（后端按需启动）')
+}
+
+export default { name, inject, Config, apply }
