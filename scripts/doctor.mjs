@@ -21,18 +21,17 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs, promisify } from 'node:util'
 
-import { DSH_REQUIREMENT } from '../lib/compat.js'
+import { DSH_REQUIREMENT, detectDshVersion } from '../lib/compat.js'
 import { resolveDriverCommand } from '../lib/host.js'
 import { MANAGED_BEGIN_RE, MANAGED_END_RE, ROW_ID_RE } from '../lib/install/patch.js'
-import { parseVersion, satisfiesRange } from '../lib/install/version.js'
+import { satisfiesRange } from '../lib/install/version.js'
+
+// Re-exported for compatibility: the implementation is shared via lib/compat.js.
+export { detectDshVersion }
 
 const PACKAGE_NAME = 'dsh-computer'
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const DEFAULT_PROFILE = 'desktop'
-const VERSION_RE = /\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/
-// A manifest is only trusted as DSH's own: `@deepseek-ai/dsh*` or any
-// deepseek+harness package name. Generic `<home>/package.json` must not win.
-const DSH_PACKAGE_RE = /^@deepseek-ai\/dsh(?:-[a-z0-9.-]+)?$/
 
 const USAGE = `Usage: node scripts/doctor.mjs [options]
 
@@ -49,106 +48,6 @@ const defaultReadText = (path) => readFile(path, 'utf8')
 const defaultExecFile = async (file, args) => {
   const { stdout } = await execFileAsync(file, args, { timeout: 5000, windowsHide: true })
   return stdout
-}
-
-/**
- * Detect the DSH runtime version. Priority (first valid version wins):
- *   1. env `DSH_VERSION`
- *   2. `env.DSH_APP_PACKAGE_JSON` (explicit package.json for packaged/dev hosts)
- *   3. known install files relative to the DSH home:
- *      `<dshHome>/version` (version sentinel),
- *      `<install-root>/resources/app/package.json` (unpacked desktop),
- *      `<install-root>/package.json` (portable/dev install).
- *      Package manifests are only accepted when `name` is a DSH package name,
- *      so an unrelated `<home>/package.json` is ignored.
- *   4. `dsh --version` from PATH; on win32 through
- *      `cmd.exe /d /s /c "dsh --version"` so the `.cmd` shim can launch
- *   5. null when nothing is detectable
- *
- * `readFile` and `execFile` are injectable so the order can be tested without a
- * real DSH install.
- *
- * @param {{dshHome?: string, env?: Record<string, string | undefined>,
- *          readFile?: (path: string) => Promise<string> | string,
- *          execFile?: (file: string, args: string[]) => Promise<any>,
- *          platform?: string}} [options]
- * @returns {Promise<string|null>}
- */
-export async function detectDshVersion({
-  dshHome,
-  env = process.env,
-  readFile: readText = defaultReadText,
-  execFile: runExecFile = defaultExecFile,
-  platform = process.platform,
-} = {}) {
-  const fromEnv = normaliseVersion(env?.DSH_VERSION)
-  if (fromEnv !== null) return fromEnv
-
-  const explicitPackage = env?.DSH_APP_PACKAGE_JSON
-  if (typeof explicitPackage === 'string' && explicitPackage.length > 0) {
-    const fromPackage = await readPackageVersion(explicitPackage, readText)
-    if (fromPackage !== null) return fromPackage
-  }
-
-  if (typeof dshHome === 'string' && dshHome.length > 0) {
-    const fromVersionFile = await readVersionFile(join(dshHome, 'version'), readText)
-    if (fromVersionFile !== null) return fromVersionFile
-
-    const installRoot = dirname(resolve(dshHome))
-    for (const candidate of [
-      join(installRoot, 'resources', 'app', 'package.json'),
-      join(installRoot, 'package.json'),
-    ]) {
-      const fromPackage = await readPackageVersion(candidate, readText, { requireDshName: true })
-      if (fromPackage !== null) return fromPackage
-    }
-  }
-
-  try {
-    const output =
-      platform === 'win32'
-        ? await runExecFile('cmd.exe', ['/d', '/s', '/c', 'dsh --version'])
-        : await runExecFile('dsh', ['--version'])
-    const text = typeof output === 'string' ? output : output?.stdout
-    const fromExec = normaliseVersion(String(text ?? '').match(VERSION_RE)?.[0])
-    if (fromExec !== null) return fromExec
-  } catch {
-    // dsh is not on PATH or has no --version: version stays unknown
-  }
-
-  return null
-}
-
-async function readPackageVersion(path, readText, { requireDshName = false } = {}) {
-  try {
-    const manifest = JSON.parse(await readText(path))
-    if (requireDshName && !isDshManifestName(manifest?.name)) return null
-    return normaliseVersion(manifest?.version)
-  } catch {
-    return null
-  }
-}
-
-function isDshManifestName(name) {
-  if (typeof name !== 'string') return false
-  const value = name.trim().toLowerCase()
-  return DSH_PACKAGE_RE.test(value) || (value.includes('deepseek') && value.includes('harness'))
-}
-
-async function readVersionFile(path, readText) {
-  try {
-    const text = String(await readText(path)).trim()
-    const value = text.startsWith('{') ? JSON.parse(text)?.version : text.match(VERSION_RE)?.[0]
-    return normaliseVersion(value)
-  } catch {
-    return null
-  }
-}
-
-function normaliseVersion(value) {
-  if (typeof value !== 'string') return null
-  const candidate = value.trim().replace(/^v/, '')
-  return parseVersion(candidate) ? candidate : null
 }
 
 /**
@@ -189,7 +88,7 @@ export async function doctor({
     dshHome: resolvedDshHome,
     env,
     readFile: readFileOption ?? defaultReadText,
-    ...(runExecFile === undefined ? {} : { execFile: runExecFile }),
+    execFile: runExecFile ?? defaultExecFile,
   })
   const manifest = await readManifest()
   const checks = [

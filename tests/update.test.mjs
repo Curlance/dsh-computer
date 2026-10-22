@@ -26,7 +26,7 @@ import {
   rollback,
   switchCurrent,
 } from '../lib/update/install.js'
-import { runUpdate } from '../scripts/update.mjs'
+import { printError, printResult, runUpdate } from '../scripts/update.mjs'
 
 const execFileAsync = promisify(execFile)
 const PACKAGE_NAME = 'dsh-computer'
@@ -77,16 +77,34 @@ async function linkPointsTo(linkPath, target) {
     : actual === resolve(target)
 }
 
+/** Capture console.log/error while running a synchronous printer function. */
+function captureConsole(fn) {
+  const logs = []
+  const errors = []
+  const originalLog = console.log
+  const originalError = console.error
+  console.log = (...args) => logs.push(args.join(' '))
+  console.error = (...args) => errors.push(args.join(' '))
+  try {
+    fn()
+  } finally {
+    console.log = originalLog
+    console.error = originalError
+  }
+  return { logs, errors }
+}
+
 /** Create a scratch DSH layout. Nothing here touches the real `~/.dsh`. */
 async function createLayout(t, options = {}) {
-  const { version = '0.1.0', patch = 'plugins:\n  existing: true\n' } = options
+  const { version = '0.1.0', patch = 'plugins:\n  existing: true\n', profile = 'desktop' } = options
   const root = await mkdtemp(join(tmpdir(), 'dsh-update-'))
   t.after(() => rm(root, { recursive: true, force: true }))
 
   const home = join(root, 'home')
   const dshHome = join(home, '.dsh')
   const pluginsDir = join(dshHome, 'plugins')
-  const profileNodeModules = join(dshHome, 'profiles', 'desktop', 'node_modules')
+  const profileDir = join(dshHome, 'profiles', profile)
+  const profileNodeModules = join(profileDir, 'node_modules')
   const stateDir = join(dshHome, 'computer', 'update')
   const patchPath = join(dshHome, 'cordis.patch.yml')
 
@@ -112,6 +130,8 @@ async function createLayout(t, options = {}) {
     home,
     dshHome,
     pluginsDir,
+    profile,
+    profileDir,
     profileNodeModules,
     stateDir,
     patchPath,
@@ -443,6 +463,33 @@ test('needsRollback is true only for a pending switch without a fresh heartbeat'
   assert.equal(await needsRollback({ stateDir: layout.stateDir, now }), true)
 })
 
+test('needsRollback does not accept an updater-source heartbeat as confirmation', async (t) => {
+  const layout = await createLayout(t, { version: null })
+  const now = () => new Date('2026-10-22T00:10:00.000Z')
+  await mkdir(layout.stateDir, { recursive: true })
+  await writeJson(join(layout.stateDir, 'pending.json'), {
+    version: '0.2.0',
+    at: '2026-10-22T00:09:00.000Z',
+  })
+
+  // The updater writes its own heartbeat after switching; that must never be
+  // mistaken for the runtime confirming the new version.
+  await writeJson(join(layout.stateDir, 'heartbeat.json'), {
+    version: '0.2.0',
+    dshVersion: DSH_VERSION,
+    source: 'updater',
+    at: '2026-10-22T00:09:30.000Z',
+  })
+  assert.equal(await needsRollback({ stateDir: layout.stateDir, now }), true)
+
+  await writeJson(join(layout.stateDir, 'heartbeat.json'), {
+    version: '0.2.0',
+    dshVersion: DSH_VERSION,
+    at: '2026-10-22T00:09:30.000Z',
+  })
+  assert.equal(await needsRollback({ stateDir: layout.stateDir, now }), true)
+})
+
 // ---------------------------------------------------------------- rollback
 
 test('rollback restores the previous link and patch backup, then is idempotent', async (t) => {
@@ -471,6 +518,10 @@ test('rollback restores the previous link and patch backup, then is idempotent',
   assert.equal(result.restored, '0.1.0')
   assert.equal(result.patch, layout.patchPath)
   assert.equal(await linkPointsTo(layout.linkPath, layout.versionDir), true)
+  assert.deepEqual(
+    (await readdir(layout.profileNodeModules)).filter((name) => name.includes('.tmp-')),
+    [],
+  )
   assert.equal(await readFile(layout.patchPath, 'utf8'), 'plugins:\n  existing: true\n')
   assert.equal(await exists(join(layout.stateDir, 'pending.json')), false)
   assert.equal(await exists(join(layout.stateDir, 'previous.json')), false)
@@ -730,4 +781,175 @@ test('runUpdate --rollback is a no-op when nothing was switched', async (t) => {
 
   assert.deepEqual(result, { action: 'rollback', restored: null, patch: null })
   assert.equal(await linkPointsTo(layout.linkPath, layout.versionDir), true)
+})
+
+test('runUpdate --check detects DSH through the injected win32 cmd shim', async (t) => {
+  const layout = await createLayout(t)
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([release('0.2.0')]))
+  const calls = []
+
+  const result = await runUpdate({
+    argv: ['--home', layout.home, '--manifest', manifestPath, '--check'],
+    env: {},
+    platform: 'win32',
+    execFile: async (file, args) => {
+      calls.push([file, args])
+      return { stdout: 'DeepSeek Harness 0.2.2\n' }
+    },
+  })
+
+  assert.equal(result.dshVersion, '0.2.2')
+  assert.equal(result.available.version, '0.2.0')
+  assert.deepEqual(calls, [['cmd.exe', ['/d', '/s', '/c', 'dsh --version']]])
+})
+
+test('runUpdate --check detects DSH from <dshHome>/version before PATH', async (t) => {
+  const layout = await createLayout(t)
+  await writeFile(join(layout.dshHome, 'version'), '0.2.2\n', 'utf8')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([release('0.2.0')]))
+  let execCalled = false
+
+  const result = await runUpdate({
+    argv: ['--home', layout.home, '--manifest', manifestPath, '--check'],
+    env: {},
+    execFile: async () => {
+      execCalled = true
+      return { stdout: '0.3.0' }
+    },
+  })
+
+  assert.equal(result.dshVersion, '0.2.2')
+  assert.equal(execCalled, false)
+})
+
+test('runUpdate --apply switches a non-default profile', async (t) => {
+  const layout = await createLayout(t, { profile: 'beta' })
+  const targetBytes = Buffer.from('tarball-0.2.0')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([{ ...release('0.2.0'), sha256: sha256(targetBytes) }]))
+
+  const result = await runUpdate({
+    argv: ['--home', layout.home, '--profile', 'beta', '--manifest', manifestPath, '--apply'],
+    env: { DSH_VERSION },
+    fetchImpl: fetchBytes(targetBytes),
+    extractImpl: extractAs('0.2.0'),
+    isDshRunning: async () => false,
+  })
+
+  assert.equal(result.from, '0.1.0')
+  assert.equal(result.to, '0.2.0')
+  assert.equal(
+    await linkPointsTo(layout.linkPath, join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`)),
+    true,
+  )
+  // The default profile is untouched when --profile selects another one.
+  assert.equal(
+    await exists(join(layout.dshHome, 'profiles', 'desktop', 'node_modules', PACKAGE_NAME)),
+    false,
+  )
+})
+
+test('runUpdate --patch backs up and restores the configured patch file', async (t) => {
+  const layout = await createLayout(t)
+  const customPatch = join(layout.root, 'custom', 'cordis.patch.yml')
+  await mkdir(dirname(customPatch), { recursive: true })
+  await writeFile(customPatch, 'plugins:\n  custom: true\n', 'utf8')
+  const targetBytes = Buffer.from('tarball-0.2.0')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([{ ...release('0.2.0'), sha256: sha256(targetBytes) }]))
+
+  const options = {
+    env: { DSH_VERSION },
+    fetchImpl: fetchBytes(targetBytes),
+    extractImpl: extractAs('0.2.0'),
+    isDshRunning: async () => false,
+  }
+  await runUpdate({
+    ...options,
+    argv: ['--home', layout.home, '--patch', customPatch, '--manifest', manifestPath, '--apply'],
+  })
+
+  // The default patch file was not the configured one, so it was not backed up.
+  assert.equal(await readFile(layout.patchPath, 'utf8'), 'plugins:\n  existing: true\n')
+  await writeFile(customPatch, 'plugins:\n  custom: false\n', 'utf8')
+
+  const result = await runUpdate({
+    ...options,
+    argv: ['--home', layout.home, '--patch', customPatch, '--rollback'],
+  })
+
+  assert.equal(result.restored, '0.1.0')
+  assert.equal(result.patch, customPatch)
+  assert.equal(await readFile(customPatch, 'utf8'), 'plugins:\n  custom: true\n')
+})
+
+test('runUpdate --apply refuses to overwrite previous.json while a switch is unconfirmed', async (t) => {
+  const layout = await createLayout(t)
+  const targetBytes = Buffer.from('tarball-0.2.0')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([{ ...release('0.2.0'), sha256: sha256(targetBytes) }]))
+  const now = () => new Date('2026-10-22T00:10:00.000Z')
+  await mkdir(layout.stateDir, { recursive: true })
+  const previous = {
+    version: '0.1.0',
+    path: layout.versionDir,
+    patchBackup: null,
+    at: '2026-10-22T00:00:00.000Z',
+  }
+  await writeJson(join(layout.stateDir, 'previous.json'), previous)
+  await writeJson(join(layout.stateDir, 'pending.json'), {
+    version: '0.2.0',
+    at: '2026-10-22T00:00:00.000Z',
+  })
+  // A fresh heartbeat from the updater itself must not be treated as runtime
+  // confirmation, so --apply has to refuse instead of replacing previous.json.
+  await writeJson(join(layout.stateDir, 'heartbeat.json'), {
+    version: '0.2.0',
+    dshVersion: DSH_VERSION,
+    source: 'updater',
+    at: '2026-10-22T00:09:30.000Z',
+  })
+  let fetched = false
+
+  await assert.rejects(
+    runUpdate({
+      argv: ['--home', layout.home, '--manifest', manifestPath, '--apply'],
+      env: { DSH_VERSION },
+      fetchImpl: async () => {
+        fetched = true
+        return bytesResponse(targetBytes)
+      },
+      extractImpl: extractAs('0.2.0'),
+      now,
+    }),
+    /previous update is unconfirmed/,
+  )
+
+  assert.equal(fetched, false)
+  assert.deepEqual(await readJson(join(layout.stateDir, 'previous.json')), previous)
+  assert.equal(await linkPointsTo(layout.linkPath, layout.versionDir), true)
+})
+
+test('printResult --check reports an unknown DSH version instead of no release', () => {
+  const { logs } = captureConsole(() => {
+    printResult(
+      { action: 'check', current: null, dshVersion: null, available: null, changed: false },
+      false,
+    )
+  })
+
+  assert.ok(logs.some((line) => line.includes('dsh: unknown')))
+  assert.ok(logs.some((line) => line.includes('available: unknown')))
+  assert.ok(!logs.some((line) => line.includes('no release supports')))
+})
+
+test('printError emits {ok:false,error} for --json failures', () => {
+  const json = captureConsole(() => printError(new Error('boom'), true))
+  assert.deepEqual(JSON.parse(json.logs[0]), { ok: false, error: 'boom' })
+
+  const human = captureConsole(() => printError(new Error('boom'), false))
+  assert.deepEqual(human.logs, [])
+  assert.deepEqual(human.errors, ['update: boom'])
 })

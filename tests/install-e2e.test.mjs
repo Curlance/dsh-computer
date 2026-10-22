@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
 import { detectDshVersion, doctor } from '../scripts/doctor.mjs'
+import { detectDshVersion as detectDshVersionShared } from '../lib/compat.js'
 
 const run = promisify(execFile)
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -416,6 +417,10 @@ test('doctor version detection prefers <dshHome>/version over DSH package manife
   })
 
   assert.equal(version, DSH_VERSION)
+})
+
+test('doctor re-exports the shared lib/compat.js detectDshVersion', () => {
+  assert.equal(detectDshVersion, detectDshVersionShared)
 })
 
 test('doctor version detection launches dsh through cmd.exe on win32', async (t) => {

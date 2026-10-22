@@ -6,14 +6,22 @@
  *   3. atomically repoint `<dsh-home>/profiles/<profile>/node_modules/dsh-computer`;
  *   4. leave previous/pending markers so `--rollback` can restore the old version.
  *
- * Running-DSH detection: DSH has no portable single-instance lock, so the
- * default treats a heartbeat younger than 10 minutes, written by a non-updater
- * source (`source !== 'updater'`), as "DSH is running" and refuses to switch.
- * The DSH runtime owns that heartbeat; `isDshRunning` is injectable for tests.
+ * DSH version detection is shared with `scripts/doctor.mjs` (lib/compat.js):
+ * DSH_VERSION -> DSH_APP_PACKAGE_JSON -> `<dshHome>/version` and known app
+ * package paths -> `dsh --version` (through the cmd.exe shim on win32).
  *
- * Every path can be redirected with `--home`, so nothing touches the real
- * `~/.dsh`. `--check` prints the selected release; `--apply` performs the
- * switch; `--rollback` restores the previous version and patch backup.
+ * Running-DSH detection: DSH has no portable single-instance lock, so until the
+ * runtime writes its own heartbeat this is heartbeat-based: a heartbeat younger
+ * than 10 minutes from a non-updater source counts as "DSH is running" and the
+ * switch is refused. Only a heartbeat with `source: 'runtime'` confirms a
+ * pending switch; a pending switch with any other, missing, malformed or stale
+ * heartbeat is rollback-required, so `--apply` refuses instead of overwriting
+ * `previous.json`. `isDshRunning` is injectable for tests.
+ *
+ * Every path can be redirected with `--home`, `--profile` and `--patch`, so
+ * nothing touches the real `~/.dsh`. `--check` prints the selected release;
+ * `--apply` performs the switch; `--rollback` restores the previous version and
+ * the patch backup.
  */
 
 import { execFile } from 'node:child_process'
@@ -37,7 +45,6 @@ import {
 const execFileAsync = promisify(execFile)
 
 const PACKAGE_NAME = 'dsh-computer'
-const PROFILE = 'desktop'
 const DEFAULT_STALE_MS = 600000
 
 const USAGE = `Usage: node scripts/update.mjs [options]
@@ -45,6 +52,9 @@ const USAGE = `Usage: node scripts/update.mjs [options]
 Options:
   --home <path>      User home directory; DSH files live in <home>/.dsh
                      (default: $DSH_HOME, or ~/.dsh when DSH_HOME is unset)
+  --profile <name>   DSH profile name (default: desktop)
+  --patch <path>     Patch file to back up and restore
+                     (default: <dsh-home>/cordis.patch.yml)
   --manifest <src>   Release manifest: a local file path or an http(s) URL
                      (required for --check and --apply)
   --check            Report the installed and selected versions without writing
@@ -54,12 +64,19 @@ Options:
   -h, --help         Show this help
 `
 
+const defaultExecFile = async (file, args) => {
+  const { stdout } = await execFileAsync(file, args, { timeout: 5000, windowsHide: true })
+  return stdout
+}
+
 /**
  * Run the updater without writing to stdout (the CLI entry point prints).
  *
  * @param {{
  *   argv?: string[], env?: Record<string,string>,
  *   fetchImpl?: Function, extractImpl?: Function,
+ *   execFile?: (file: string, args: string[]) => Promise<any>,
+ *   platform?: string,
  *   isDshRunning?: Function, now?: Date|(() => Date),
  * }} options
  * @returns {Promise<object>}
@@ -79,15 +96,18 @@ export async function runUpdate(options = {}) {
       pluginsDir: layout.pluginsDir,
       profileNodeModules: layout.profileNodeModules,
       stateDir: layout.stateDir,
+      patchPath: layout.patchPath,
     })
     return { action: 'rollback', restored: result.restored, patch: result.patch }
   }
 
   const manifest = await loadManifest(values.manifest, fetchImpl)
   const dshVersion = await detectDshVersion({
+    dshHome: layout.dshHome,
     env,
     readFile,
-    exec: async () => (await execFileAsync('dsh', ['--version'])).stdout,
+    execFile: options.execFile ?? defaultExecFile,
+    platform: options.platform ?? process.platform,
   })
 
   if (values.check) {
@@ -140,6 +160,7 @@ export async function runUpdate(options = {}) {
     version: selected.version,
     stateDir: layout.stateDir,
     patchBackupPath,
+    patchPath: layout.patchPath,
     now,
   })
   await recordHeartbeat({
@@ -167,6 +188,8 @@ function parseCli(argv) {
       args: argv,
       options: {
         home: { type: 'string' },
+        profile: { type: 'string', default: 'desktop' },
+        patch: { type: 'string' },
         manifest: { type: 'string' },
         check: { type: 'boolean', default: false },
         apply: { type: 'boolean', default: false },
@@ -181,6 +204,9 @@ function parseCli(argv) {
   }
 
   if (values.help) return values
+  if (!/^[A-Za-z0-9._-]+$/.test(values.profile) || values.profile === '.' || values.profile === '..') {
+    throw new Error(`Invalid profile name: ${values.profile}\n\n${USAGE}`)
+  }
   const modes = [values.check, values.apply, values.rollback].filter(Boolean).length
   if (modes !== 1) throw new Error(`Exactly one of --check, --apply or --rollback is required\n\n${USAGE}`)
   if (!values.rollback && values.manifest === undefined) {
@@ -194,13 +220,15 @@ function resolveLayout(values, env) {
   const envHome = env.DSH_HOME || join(homedir(), '.dsh')
   const dshHome = home === null ? resolve(envHome) : join(home, '.dsh')
   const stateDir = join(dshHome, 'computer', 'update')
+  const profileDir = join(dshHome, 'profiles', values.profile)
   return {
     dshHome,
     pluginsDir: join(dshHome, 'plugins'),
-    profileNodeModules: join(dshHome, 'profiles', PROFILE, 'node_modules'),
+    profileDir,
+    profileNodeModules: join(profileDir, 'node_modules'),
     stateDir,
     cacheDir: join(stateDir, 'cache'),
-    patchPath: join(dshHome, 'cordis.patch.yml'),
+    patchPath: values.patch === undefined ? join(dshHome, 'cordis.patch.yml') : resolve(values.patch),
   }
 }
 
@@ -298,7 +326,7 @@ function toDate(now) {
   return date
 }
 
-function printResult(result, json) {
+export function printResult(result, json) {
   if (json) {
     console.log(JSON.stringify(result))
     return
@@ -311,7 +339,11 @@ function printResult(result, json) {
   if (result.action === 'check') {
     console.log(`current: ${result.current ?? 'not installed'}`)
     console.log(`dsh: ${result.dshVersion ?? 'unknown'}`)
-    if (result.available === null) {
+    if (result.dshVersion === null) {
+      console.log(
+        'available: unknown (cannot detect the DSH version; set DSH_VERSION or DSH_APP_PACKAGE_JSON)',
+      )
+    } else if (result.available === null) {
       console.log('available: none (no release supports this DSH)')
     } else {
       console.log(`${result.changed ? 'available' : 'up to date'}: ${result.available.version}`)
@@ -331,6 +363,13 @@ function printResult(result, json) {
   if (result.patch) console.log(`patch: ${result.patch}`)
 }
 
+/** Print a failure; `--json` emits a machine-readable `{ok:false,error}` object. */
+export function printError(error, json) {
+  const message = error instanceof Error ? error.message : String(error)
+  if (json) console.log(JSON.stringify({ ok: false, error: message }))
+  else console.error(`update: ${message}`)
+}
+
 if (
   process.argv[1] !== undefined &&
   pathToFileURL(resolve(process.argv[1])).href === import.meta.url
@@ -340,7 +379,7 @@ if (
   runUpdate({ argv })
     .then((result) => printResult(result, json))
     .catch((error) => {
-      console.error(`update: ${error.message}`)
+      printError(error, json)
       process.exitCode = 1
     })
 }
