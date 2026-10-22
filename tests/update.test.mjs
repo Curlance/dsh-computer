@@ -62,6 +62,16 @@ async function exists(path) {
   }
 }
 
+/** Temp entries left under a directory; a missing directory counts as empty. */
+async function tempEntries(dir) {
+  try {
+    return (await readdir(dir)).filter((name) => name.startsWith('.tmp-'))
+  } catch (error) {
+    if (error.code === 'ENOENT') return []
+    throw error
+  }
+}
+
 async function readJson(path) {
   return JSON.parse(await readFile(path, 'utf8'))
 }
@@ -141,7 +151,7 @@ async function createLayout(t, options = {}) {
 }
 
 async function installPackageDir(pluginsDir, version, name = PACKAGE_NAME) {
-  const dir = join(pluginsDir, `${PACKAGE_NAME}-${version}`)
+  const dir = join(pluginsDir, PACKAGE_NAME, version)
   await mkdir(dir, { recursive: true })
   await writeJson(join(dir, 'package.json'), { name, version })
   await writeFile(join(dir, 'index.js'), 'export default 1\n', 'utf8')
@@ -246,7 +256,7 @@ test('selectVersion fails closed on an unknown DSH version or a malformed entry'
 
 // ---------------------------------------------------------------- installVersion
 
-test('installVersion downloads, verifies and installs into pluginsDir', async (t) => {
+test('installVersion downloads, verifies and installs into the nested plugin dir', async (t) => {
   const layout = await createLayout(t, { version: null })
   const bytes = Buffer.from('fake-tarball-bytes')
   const cacheDir = join(layout.stateDir, 'cache')
@@ -267,7 +277,7 @@ test('installVersion downloads, verifies and installs into pluginsDir', async (t
 
   assert.deepEqual(calls, ['https://releases.test/dsh-computer-0.2.0.tgz'])
   assert.equal(result.version, '0.2.0')
-  assert.equal(result.path, join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`))
+  assert.equal(result.path, join(layout.pluginsDir, PACKAGE_NAME, '0.2.0'))
   assert.equal(await exists(join(result.path, 'package.json')), true)
   assert.equal(sha256(await readFile(join(cacheDir, `${PACKAGE_NAME}-0.2.0.tgz`))), sha256(bytes))
 })
@@ -295,11 +305,8 @@ test('installVersion rejects a sha256 mismatch without leaving a partial install
     },
   )
 
-  assert.equal(await exists(join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`)), false)
-  assert.deepEqual(
-    (await readdir(layout.pluginsDir)).filter((name) => name.startsWith('.install-')),
-    [],
-  )
+  assert.equal(await exists(join(layout.pluginsDir, PACKAGE_NAME, '0.2.0')), false)
+  assert.deepEqual(await tempEntries(join(layout.pluginsDir, PACKAGE_NAME)), [])
 })
 
 test('installVersion reuses an existing identical version without downloading', async (t) => {
@@ -321,6 +328,36 @@ test('installVersion reuses an existing identical version without downloading', 
   assert.equal(result.path, existing)
 })
 
+test('installVersion refuses to overwrite a nested dir with a different identity', async (t) => {
+  const layout = await createLayout(t, { version: null })
+  const target = join(layout.pluginsDir, PACKAGE_NAME, '0.2.0')
+  await mkdir(target, { recursive: true })
+  await writeJson(join(target, 'package.json'), { name: PACKAGE_NAME, version: '0.1.0' })
+  let fetched = false
+
+  await assert.rejects(
+    installVersion({
+      cacheDir: join(layout.stateDir, 'cache'),
+      pluginsDir: layout.pluginsDir,
+      tarballUrl: 'https://releases.test/dsh-computer-0.2.0.tgz',
+      sha256: sha256(Buffer.from('unused')),
+      fetchImpl: async () => {
+        fetched = true
+        return bytesResponse(Buffer.from('unused'))
+      },
+      extractImpl: extractAs('0.2.0'),
+      version: '0.2.0',
+    }),
+    /Unexpected package version/,
+  )
+
+  assert.equal(fetched, false)
+  assert.deepEqual(await readJson(join(target, 'package.json')), {
+    name: PACKAGE_NAME,
+    version: '0.1.0',
+  })
+})
+
 test('installVersion rejects a tarball whose package identity does not match', async (t) => {
   const layout = await createLayout(t, { version: null })
   const bytes = Buffer.from('fake-tarball-bytes')
@@ -338,11 +375,8 @@ test('installVersion rejects a tarball whose package identity does not match', a
     /package name/,
   )
 
-  assert.equal(await exists(join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`)), false)
-  assert.deepEqual(
-    (await readdir(layout.pluginsDir)).filter((name) => name.startsWith('.install-')),
-    [],
-  )
+  assert.equal(await exists(join(layout.pluginsDir, PACKAGE_NAME, '0.2.0')), false)
+  assert.deepEqual(await tempEntries(join(layout.pluginsDir, PACKAGE_NAME)), [])
 })
 
 test('installVersion extracts a real npm-style tarball with the system tar', async (t) => {
@@ -381,6 +415,8 @@ test('switchCurrent repoints the link atomically and records the previous versio
 
   assert.equal(result.changed, true)
   assert.equal(result.previous, '0.1.0')
+  assert.equal(result.path, next)
+  assert.equal(next, join(layout.pluginsDir, PACKAGE_NAME, '0.2.0'))
   assert.equal(await linkPointsTo(layout.linkPath, next), true)
 
   const previous = await readJson(join(layout.stateDir, 'previous.json'))
@@ -392,6 +428,39 @@ test('switchCurrent repoints the link atomically and records the previous versio
     (await readdir(layout.profileNodeModules)).filter((name) => name.includes('.tmp-')),
     [],
   )
+})
+
+test('switchCurrent accepts a legacy flat install as the previous version', async (t) => {
+  const layout = await createLayout(t, { version: null })
+  const flatDir = join(layout.pluginsDir, `${PACKAGE_NAME}-0.1.0`)
+  await mkdir(flatDir, { recursive: true })
+  await writeJson(join(flatDir, 'package.json'), { name: PACKAGE_NAME, version: '0.1.0' })
+  await symlink(
+    flatDir,
+    layout.linkPath,
+    process.platform === 'win32' ? 'junction' : 'dir',
+  )
+  const next = await installPackageDir(layout.pluginsDir, '0.2.0')
+
+  const result = await switchCurrent({
+    pluginsDir: layout.pluginsDir,
+    profileNodeModules: layout.profileNodeModules,
+    version: '0.2.0',
+    stateDir: layout.stateDir,
+  })
+
+  assert.equal(result.previous, '0.1.0')
+  assert.equal(await linkPointsTo(layout.linkPath, next), true)
+  const previous = await readJson(join(layout.stateDir, 'previous.json'))
+  assert.equal(previous.version, '0.1.0')
+  assert.equal(previous.path, flatDir)
+
+  await rollback({
+    pluginsDir: layout.pluginsDir,
+    profileNodeModules: layout.profileNodeModules,
+    stateDir: layout.stateDir,
+  })
+  assert.equal(await linkPointsTo(layout.linkPath, flatDir), true)
 })
 
 test('switchCurrent refuses to replace a real directory at the link path', async (t) => {
@@ -580,7 +649,7 @@ test('runUpdate --apply refuses to switch while DSH is running', async (t) => {
 
   assert.equal(fetched, false)
   assert.equal(await linkPointsTo(layout.linkPath, layout.versionDir), true)
-  assert.equal(await exists(join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`)), false)
+  assert.equal(await exists(join(layout.pluginsDir, PACKAGE_NAME, '0.2.0')), false)
 })
 
 test('runUpdate --apply downloads, switches and records a heartbeat', async (t) => {
@@ -609,8 +678,12 @@ test('runUpdate --apply downloads, switches and records a heartbeat', async (t) 
   assert.equal(result.from, '0.1.0')
   assert.equal(result.to, '0.2.0')
   assert.equal(
-    await linkPointsTo(layout.linkPath, join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`)),
+    await linkPointsTo(layout.linkPath, join(layout.pluginsDir, PACKAGE_NAME, '0.2.0')),
     true,
+  )
+  assert.equal(
+    (await readJson(join(layout.stateDir, 'previous.json'))).path,
+    join(layout.pluginsDir, PACKAGE_NAME, '0.1.0'),
   )
 
   const heartbeat = await readJson(join(layout.stateDir, 'heartbeat.json'))
@@ -653,7 +726,7 @@ test('runUpdate --apply leaves the old version when integrity verification fails
   )
 
   assert.equal(await linkPointsTo(layout.linkPath, layout.versionDir), true)
-  assert.equal(await exists(join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`)), false)
+  assert.equal(await exists(join(layout.pluginsDir, PACKAGE_NAME, '0.2.0')), false)
   assert.equal(await exists(join(layout.stateDir, 'pending.json')), false)
 })
 
@@ -841,7 +914,7 @@ test('runUpdate --apply switches a non-default profile', async (t) => {
   assert.equal(result.from, '0.1.0')
   assert.equal(result.to, '0.2.0')
   assert.equal(
-    await linkPointsTo(layout.linkPath, join(layout.pluginsDir, `${PACKAGE_NAME}-0.2.0`)),
+    await linkPointsTo(layout.linkPath, join(layout.pluginsDir, PACKAGE_NAME, '0.2.0')),
     true,
   )
   // The default profile is untouched when --profile selects another one.

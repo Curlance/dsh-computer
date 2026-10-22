@@ -17,14 +17,14 @@ import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { lstat, readFile, readlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs, promisify } from 'node:util'
 
 import { DSH_REQUIREMENT, detectDshVersion } from '../lib/compat.js'
 import { resolveDriverCommand } from '../lib/host.js'
 import { MANAGED_BEGIN_RE, MANAGED_END_RE, ROW_ID_RE } from '../lib/install/patch.js'
-import { satisfiesRange } from '../lib/install/version.js'
+import { satisfiesRange, parseVersion } from '../lib/install/version.js'
 
 // Re-exported for compatibility: the implementation is shared via lib/compat.js.
 export { detectDshVersion }
@@ -218,22 +218,65 @@ async function pluginCheck({ dshHome, profile, manifest }) {
     return check('plugin-install', false, 'cannot read this package.json; reinstall dsh-computer')
   }
 
-  const versionDir = join(dshHome, 'plugins', PACKAGE_NAME, manifest.version)
+  const pluginsDir = join(dshHome, 'plugins')
+  const nestedVersionDir = join(pluginsDir, PACKAGE_NAME, manifest.version)
+  const flatVersionDir = join(pluginsDir, `${PACKAGE_NAME}-${manifest.version}`)
   const linkPath = join(profile, 'node_modules', PACKAGE_NAME)
 
-  if (!(await isDirectory(versionDir))) {
-    return check('plugin-install', false, `plugin directory missing at ${versionDir}; run node scripts/install.mjs`)
-  }
+  let target = null
   try {
     const stats = await lstat(linkPath)
-    const target = stats.isSymbolicLink() ? resolve(dirname(linkPath), await readlink(linkPath)) : null
-    if (target !== null && samePath(target, versionDir)) {
-      return check('plugin-install', true, `${linkPath} -> ${versionDir}`)
+    if (stats.isSymbolicLink()) {
+      target = resolve(dirname(linkPath), await readlink(linkPath))
     }
   } catch (error) {
     if (error.code !== 'ENOENT') throw error
   }
-  return check('plugin-install', false, `plugin link missing or stale at ${linkPath}; run node scripts/install.mjs`)
+
+  if (target !== null) {
+    const layout = await installedLayout(pluginsDir, target)
+    if (layout !== null) {
+      const note =
+        layout === 'flat'
+          ? ' (legacy flat layout; rerun node scripts/install.mjs to migrate)'
+          : ''
+      return check('plugin-install', true, `${linkPath} -> ${target}${note}`)
+    }
+  }
+
+  if (
+    (await isDirectory(nestedVersionDir)) ||
+    (await isDirectory(flatVersionDir))
+  ) {
+    return check(
+      'plugin-install',
+      false,
+      `plugin link missing or stale at ${linkPath}; run node scripts/install.mjs`,
+    )
+  }
+  return check(
+    'plugin-install',
+    false,
+    `plugin directory missing at ${nestedVersionDir}; run node scripts/install.mjs`,
+  )
+}
+
+/**
+ * Accept the installer/updater layout (`plugins/dsh-computer/<version>`) and the
+ * legacy updater layout (`plugins/dsh-computer-<version>`) so an older flat
+ * install is reported as ok with a migration note instead of false-failing.
+ */
+async function installedLayout(pluginsDir, target) {
+  if (!(await isDirectory(target))) return null
+  const name = basename(target)
+  const parent = dirname(target)
+  if (samePath(parent, join(pluginsDir, PACKAGE_NAME))) {
+    return parseVersion(name) ? 'nested' : null
+  }
+  if (samePath(parent, pluginsDir) && name.startsWith(`${PACKAGE_NAME}-`)) {
+    return parseVersion(name.slice(PACKAGE_NAME.length + 1)) ? 'flat' : null
+  }
+  return null
 }
 
 async function readManifest() {

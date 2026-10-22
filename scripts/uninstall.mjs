@@ -3,7 +3,8 @@
  * Uninstall dsh-computer:
  *   1. remove the managed root plugin row from `<dsh-home>/cordis.patch.yml`;
  *   2. unlink `<dsh-home>/profiles/<profile>/node_modules/dsh-computer`;
- *   3. delete `<dsh-home>/plugins/dsh-computer/<version>/`;
+ *   3. delete `<dsh-home>/plugins/dsh-computer/` (nested layout) and any legacy
+ *      flat `plugins/dsh-computer-*` dirs left by old updater versions;
  *   4. remove the installed `<dsh-home>/skills/computer-use`, restoring the most
  *      recent `skills-*` backup from `<dsh-home>/computer/backup/` if present.
  *
@@ -45,8 +46,8 @@ async function main() {
     return
   }
 
-  const manifest = await readManifest()
-  const layout = resolveLayout(values, manifest.version)
+  await readManifest()
+  const layout = resolveLayout(values)
   const dryRun = values['dry-run'] === true
   const actions = []
 
@@ -54,6 +55,8 @@ async function main() {
   if (linkStats && !linkStats.isSymbolicLink()) {
     throw new Error(`Refusing to remove non-link path: ${layout.linkPath}`)
   }
+
+  const legacyDirs = await legacyVersionDirs(layout.pluginsDir)
 
   const previousPatch = await readTextIfExists(layout.patchPath)
   const nextPatch = previousPatch === null ? null : removePluginRow(previousPatch, PACKAGE_NAME)
@@ -72,7 +75,8 @@ async function main() {
         ? `[dry-run] unlink ${layout.linkPath}`
         : `[dry-run] link absent: ${layout.linkPath}`,
     )
-    actions.push(`[dry-run] remove ${layout.versionDir}`)
+    actions.push(`[dry-run] remove ${layout.packageDir}`)
+    for (const dir of legacyDirs) actions.push(`[dry-run] remove legacy ${dir}`)
     actions.push(
       skillStats
         ? `[dry-run] remove ${layout.skillDir}`
@@ -103,8 +107,12 @@ async function main() {
     actions.push(`link absent: ${layout.linkPath}`)
   }
 
-  await rm(layout.versionDir, { recursive: true, force: true })
-  actions.push(`remove: ${layout.versionDir}`)
+  await rm(layout.packageDir, { recursive: true, force: true })
+  actions.push(`remove: ${layout.packageDir}`)
+  for (const dir of legacyDirs) {
+    await rm(dir, { recursive: true, force: true })
+    actions.push(`remove legacy: ${dir}`)
+  }
 
   await uninstallSkill(layout, actions)
 
@@ -144,18 +152,40 @@ async function readManifest() {
   return manifest
 }
 
-function resolveLayout(values, version) {
+function resolveLayout(values) {
   const home = values.home === undefined ? null : resolve(values.home)
   const envHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const dshHome = home === null ? resolve(envHome) : join(home, '.dsh')
+  const pluginsDir = join(dshHome, 'plugins')
   return {
-    versionDir: join(dshHome, 'plugins', PACKAGE_NAME, version),
+    pluginsDir,
+    packageDir: join(pluginsDir, PACKAGE_NAME),
     linkPath: join(dshHome, 'profiles', values.profile, 'node_modules', PACKAGE_NAME),
     skillsDir: join(dshHome, 'skills'),
     skillDir: join(dshHome, 'skills', SKILL_NAME),
     patchPath: resolve(values.patch ?? join(dshHome, 'cordis.patch.yml')),
     backupDir: join(dshHome, 'computer', 'backup'),
   }
+}
+
+/** Legacy updater layout: `plugins/dsh-computer-<version>` directories. */
+async function legacyVersionDirs(pluginsDir) {
+  let names
+  try {
+    names = await readdir(pluginsDir)
+  } catch (error) {
+    if (error.code === 'ENOENT') return []
+    throw error
+  }
+
+  const prefix = `${PACKAGE_NAME}-`
+  const dirs = []
+  for (const name of names.filter((entry) => entry.startsWith(prefix)).sort()) {
+    const candidate = join(pluginsDir, name)
+    const stats = await lstatIfExists(candidate)
+    if (stats?.isDirectory()) dirs.push(candidate)
+  }
+  return dirs
 }
 
 async function uninstallSkill(layout, actions) {

@@ -1,13 +1,27 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  readlink,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
+import { clearPending, installVersion, switchCurrent } from '../lib/update/install.js'
 import { detectDshVersion, doctor } from '../scripts/doctor.mjs'
+import { runUpdate } from '../scripts/update.mjs'
 import { detectDshVersion as detectDshVersionShared } from '../lib/compat.js'
 
 const run = promisify(execFile)
@@ -69,6 +83,20 @@ async function exists(path) {
 
 function checksByName(result) {
   return Object.fromEntries(result.checks.map((check) => [check.name, check]))
+}
+
+/** sha256 of bytes, lowercase hex. */
+function sha256(bytes) {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+/** Fake fetch response for raw bytes. */
+function bytesResponse(bytes) {
+  return {
+    ok: true,
+    status: 200,
+    arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+  }
 }
 
 /** Keep child processes inside the scratch tree even if they ignore `--home`. */
@@ -141,6 +169,38 @@ test('uninstall removes the row/link/version dir and keeps a patch backup', asyn
   assert.equal(await readFile(join(backupDir, backups[backups.length - 1]), 'utf8'), installedPatch)
 })
 
+test('uninstall removes the nested plugin dir and legacy flat dirs', async (t) => {
+  const layout = await createHome(t)
+  await install(layout.home)
+
+  const pluginsDir = join(layout.dshHome, 'plugins')
+  const flatDirs = [join(pluginsDir, `${PACKAGE.name}-0.0.8`), join(pluginsDir, `${PACKAGE.name}-0.0.9`)]
+  for (const [index, dir] of flatDirs.entries()) {
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'package.json'),
+      `${JSON.stringify({ name: PACKAGE.name, version: `0.0.${8 + index}` })}\n`,
+    )
+  }
+  const unrelated = join(pluginsDir, 'other-plugin')
+  await mkdir(unrelated, { recursive: true })
+
+  // An old updater may have left the link pointing at a flat dir.
+  await unlink(layout.linkPath)
+  await symlink(flatDirs[1], layout.linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+
+  const { stdout } = await uninstall(layout.home)
+  assert.match(stdout, /unlink:/)
+  assert.match(stdout, /remove: .*dsh-computer/)
+  assert.match(stdout, /remove legacy: .*dsh-computer-0\.0\.8/)
+
+  assert.equal(await exists(layout.linkPath), false)
+  assert.equal(await exists(join(pluginsDir, PACKAGE.name)), false)
+  assert.equal(await exists(layout.versionDir), false)
+  for (const dir of flatDirs) assert.equal(await exists(dir), false)
+  assert.equal(await exists(unrelated), true)
+})
+
 test('doctor reports every check ok for a completed install', async (t) => {
   const layout = await createHome(t)
   await install(layout.home)
@@ -185,6 +245,79 @@ test('doctor finds cua-driver on PATH when no backend is injected', async (t) =>
   const driver = checksByName(result)['cua-driver']
   assert.equal(driver.ok, true)
   assert.match(driver.detail, /cua-driver(\.exe)?$/)
+})
+
+test('doctor accepts an updater-installed nested plugin without a downgrade', async (t) => {
+  const layout = await createHome(t)
+  await install(layout.home)
+
+  // Simulate a newer auto-update: the updater writes the nested layout and
+  // repoints the profile link, exactly as scripts/update.mjs --apply does.
+  const updaterVersion = '0.1.1'
+  const bytes = Buffer.from(`tarball-${updaterVersion}`)
+  const pluginsDir = join(layout.dshHome, 'plugins')
+  const stateDir = join(layout.dshHome, 'computer', 'update')
+  const profileNodeModules = join(layout.profileDir, 'node_modules')
+
+  const installed = await installVersion({
+    cacheDir: join(stateDir, 'cache'),
+    pluginsDir,
+    tarballUrl: `https://releases.test/${PACKAGE.name}-${updaterVersion}.tgz`,
+    sha256: sha256(bytes),
+    version: updaterVersion,
+    fetchImpl: async () => bytesResponse(bytes),
+    extractImpl: async (_tarballPath, destDir) => {
+      await writeFile(
+        join(destDir, 'package.json'),
+        `${JSON.stringify({ name: PACKAGE.name, version: updaterVersion })}\n`,
+      )
+      await writeFile(join(destDir, 'index.js'), 'export default 1\n')
+    },
+  })
+  assert.equal(installed.path, join(pluginsDir, PACKAGE.name, updaterVersion))
+  await switchCurrent({
+    pluginsDir,
+    profileNodeModules,
+    version: updaterVersion,
+    stateDir,
+  })
+  await clearPending({ stateDir })
+
+  const result = await doctor({
+    home: layout.home,
+    profileDir: layout.profileDir,
+    backend: { doctor: async () => ({ ok: true, detail: 'fake driver ready' }) },
+    env: { DSH_APP_PACKAGE_JSON: layout.dshPackageJson },
+  })
+  assert.equal(result.ok, true)
+  const plugin = checksByName(result)['plugin-install']
+  assert.equal(plugin.ok, true, plugin.detail)
+  assert.ok(plugin.detail.includes(updaterVersion), plugin.detail)
+
+  // The update check sees the updater install as current, so no reinstall (and
+  // therefore no downgrade to this checkout's older package version) is due.
+  const manifestPath = join(layout.home, 'manifest.json')
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify({
+      versions: [
+        {
+          version: updaterVersion,
+          dsh: '>=0.2.1-rc.2 <0.3.0',
+          tarball: `https://releases.test/${PACKAGE.name}-${updaterVersion}.tgz`,
+          sha256: sha256(bytes),
+        },
+      ],
+    })}\n`,
+  )
+  const check = await runUpdate({
+    argv: ['--home', layout.home, '--manifest', manifestPath, '--check'],
+    env: { DSH_VERSION },
+  })
+  assert.equal(check.current, updaterVersion)
+  assert.equal(check.changed, false)
+  assert.equal(check.rollbackRequired, false)
+  assert.equal(await linkPointsTo(layout.linkPath, installed.path), true)
 })
 
 test('doctor fails with actionable details when the environment is not installed', async (t) => {

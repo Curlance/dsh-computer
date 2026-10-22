@@ -2,7 +2,8 @@
 /**
  * Update dsh-computer from a signed-by-sha256 release manifest:
  *   1. select the highest release compatible with the running DSH version;
- *   2. download, verify and extract it under `<dsh-home>/plugins/`;
+ *   2. download, verify and extract it under
+ *      `<dsh-home>/plugins/dsh-computer/<version>/` (the installer's layout);
  *   3. atomically repoint `<dsh-home>/profiles/<profile>/node_modules/dsh-computer`;
  *   4. leave previous/pending markers so `--rollback` can restore the old version.
  *
