@@ -439,6 +439,20 @@ test('a transport error retries once through createClient and uses the replaceme
   assert.equal(first.calls.length, 1)
 })
 
+test('close() shuts down the replacement client after a reconnect', async () => {
+  const first = createFakeClient(() => {
+    throw new McpError('MCP transport stream ended')
+  })
+  const replacement = createFakeClient(() => textResult('recovered'))
+  const backend = createCuaBackend({ client: first, createClient: () => replacement })
+
+  await backend.listWindows()
+
+  await backend.close()
+  assert.equal(first.state.closes, 1)
+  assert.equal(replacement.state.closes, 1)
+})
+
 test('a rejecting close() on the old transport still allows the one retry', async () => {
   const transportFailure = new McpError('MCP transport stream ended')
   const first = createFakeClient(() => {
