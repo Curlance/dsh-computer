@@ -49,6 +49,7 @@ function fixture({
   const policyCalls = []
   const persistCalls = []
   const backendCalls = []
+  const glideCalls = []
 
   const sessions = {
     current: null,
@@ -204,13 +205,18 @@ function fixture({
     }
   }
 
+  const glide = async (point, observed) => {
+    glideCalls.push({ point, observation: observed })
+  }
+
   return {
-    deps: { backend, observer, policy, sessions, control, audit, persistImage, config: {} },
+    deps: { backend, observer, policy, sessions, control, audit, persistImage, glide, config: {} },
     log,
     auditEvents,
     policyCalls,
     persistCalls,
     backendCalls,
+    glideCalls,
     observer,
     sessions,
     control,
@@ -476,6 +482,8 @@ test('act order is policy -> control -> execute -> audit, with observed:true', a
   assert.equal(authorized.action.op, 'click')
   assert.equal(authorized.action.observed, true)
   assert.equal(authorized.action.delivery, 'background')
+  assert.equal(authorized.action.app, 'Editor')
+  assert.equal(authorized.action.pid, 100)
   assert.deepEqual(authorized.target, { element: 'save' })
   assert.equal(authorized.session.sessionId, 'session-1')
 
@@ -488,6 +496,22 @@ test('act order is policy -> control -> execute -> audit, with observed:true', a
   assert.equal(f.auditEvents[0].effect, 'confirmed')
   assert.equal(f.auditEvents[0].observationRevision, 4)
   assert.equal(typeof f.auditEvents[0].durationMs, 'number')
+})
+
+test('dispatch forwards deps.glide to act execution', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, true)
+  assert.equal(f.glideCalls.length, 1)
+  assert.deepEqual(f.glideCalls[0].point, { x: 20, y: 20 })
+  assert.equal(f.glideCalls[0].observation.revision, 4)
 })
 
 test('control=user refuses the action before the backend runs', async () => {

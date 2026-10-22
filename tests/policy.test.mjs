@@ -341,3 +341,173 @@ test('use target passed to authorize when the action has none', async () => {
   })
   assert.deepEqual(result, { allowed: true, reason: 'allowed', risk: 'medium' })
 })
+
+// --- configurable app gates ------------------------------------------------
+
+const policyConfig = (policy, mode = 'ask') => ({ approvals: { mode }, policy })
+
+test('blockedApps denies an action even when approval would allow it', async () => {
+  const approval = makeApproval('approved')
+  const policy = createPolicy({
+    config: policyConfig({ blockedApps: ['task manager'] }),
+    approval,
+  })
+
+  const result = await policy.authorize({
+    action: { op: 'click', app: 'Task Manager', observed: true },
+    target: { element: 1 },
+  })
+
+  assert.deepEqual(result, { allowed: false, reason: 'blocked-app', risk: 'low' })
+  assert.equal(approval.calls.length, 0)
+})
+
+test('blockedApps also matches the target app field case-insensitively', async () => {
+  const policy = createPolicy({
+    config: policyConfig({ blockedApps: ['终端'] }),
+    approval: makeApproval('approved'),
+  })
+
+  const result = await policy.authorize({
+    action: { op: 'type', text: 'dir', observed: true },
+    target: { element: 1, app: 'Windows 终端' },
+  })
+
+  assert.equal(result.allowed, false)
+  assert.equal(result.reason, 'blocked-app')
+})
+
+test('an empty allowedApps list admits any app', async () => {
+  const policy = createPolicy({
+    config: policyConfig({ allowedApps: [] }),
+    approval: makeApproval('approved'),
+  })
+
+  const result = await policy.authorize({
+    action: { op: 'click', app: 'Task Manager', observed: true },
+    target: { element: 1 },
+  })
+
+  assert.deepEqual(result, { allowed: true, reason: 'allowed', risk: 'low' })
+})
+
+test('a non-empty allowedApps list denies an unmatched app without approval', async () => {
+  const approval = makeApproval('approved')
+  const policy = createPolicy({
+    config: policyConfig({ allowedApps: ['notepad'] }),
+    approval,
+  })
+
+  const result = await policy.authorize({
+    action: { op: 'click', app: 'Terminal', observed: true },
+    target: { element: 1 },
+  })
+
+  assert.deepEqual(result, { allowed: false, reason: 'app-not-allowed', risk: 'low' })
+  assert.equal(approval.calls.length, 0)
+})
+
+test('an allowedApps entry matches an app title by substring', async () => {
+  const policy = createPolicy({
+    config: policyConfig({ allowedApps: ['notepad'] }),
+    approval: makeApproval('approved'),
+  })
+
+  const result = await policy.authorize({
+    action: { op: 'click', app: 'Notepad - Untitled', observed: true },
+    target: { element: 1 },
+  })
+
+  assert.deepEqual(result, { allowed: true, reason: 'allowed', risk: 'low' })
+})
+
+test('a blocked app wins over an allowlist match', async () => {
+  const policy = createPolicy({
+    config: policyConfig({ allowedApps: ['notepad'], blockedApps: ['notepad'] }),
+    approval: makeApproval('approved'),
+  })
+
+  const result = await policy.authorize({
+    action: { op: 'click', app: 'Notepad', observed: true },
+    target: { element: 1 },
+  })
+
+  assert.equal(result.allowed, false)
+  assert.equal(result.reason, 'blocked-app')
+})
+
+test('app gates do not apply to observe, session or wait', async () => {
+  const policy = createPolicy({
+    config: policyConfig({ allowedApps: ['notepad'], blockedApps: ['terminal'] }),
+    approval: makeApproval('approved'),
+  })
+
+  for (const op of ['observe', 'session', 'wait']) {
+    const result = await policy.authorize({
+      action: { op, app: 'Terminal', observed: true },
+      target: {},
+    })
+    assert.equal(result.allowed, true, op)
+  }
+})
+
+// --- per-minute action rate limit -----------------------------------------
+
+test('maxActionsPerMinute denies actions once the window is full', async () => {
+  let now = 0
+  const policy = createPolicy({
+    config: policyConfig({ maxActionsPerMinute: 2 }),
+    now: () => now,
+  })
+  const click = () =>
+    policy.authorize({ action: { op: 'click', observed: true }, target: { element: 1 } })
+
+  assert.equal((await click()).allowed, true)
+  assert.equal((await click()).allowed, true)
+
+  now = 59_999
+  assert.deepEqual(await click(), { allowed: false, reason: 'rate-limited', risk: 'low' })
+
+  now = 60_000
+  assert.equal((await click()).allowed, true)
+})
+
+test('the rate limit window expires per timestamp instead of resetting wholesale', async () => {
+  let now = 0
+  const policy = createPolicy({
+    config: policyConfig({ maxActionsPerMinute: 2 }),
+    now: () => now,
+  })
+  const click = () =>
+    policy.authorize({ action: { op: 'click', observed: true }, target: { element: 1 } })
+
+  await click()
+  now = 30_000
+  await click()
+  now = 60_000
+  // Only the action at t=0 has expired; the one at t=30s still counts.
+  assert.equal((await click()).allowed, true)
+  assert.equal((await click()).reason, 'rate-limited')
+})
+
+test('observe and session are not rate limited', async () => {
+  const policy = createPolicy({
+    config: policyConfig({ maxActionsPerMinute: 1 }),
+    approval: makeApproval('approved'),
+  })
+
+  for (let index = 0; index < 5; index += 1) {
+    const observed = await policy.authorize({ action: { op: 'observe' } })
+    assert.equal(observed.allowed, true)
+    const session = await policy.authorize({
+      action: { op: 'session', observed: true },
+    })
+    assert.equal(session.allowed, true)
+  }
+
+  const click = await policy.authorize({
+    action: { op: 'click', observed: true },
+    target: { element: 1 },
+  })
+  assert.equal(click.allowed, true)
+})

@@ -1061,3 +1061,102 @@ test('executeBatch lets a step override the shared observation and options', asy
   assert.equal(backend.calls[0].args.pid, 300)
   assert.equal(backend.calls[0].args.window_id, 400)
 })
+
+// --- cursor glide wiring ---------------------------------------------------
+
+test('click glides once to the resolved element center before the backend runs', async () => {
+  const backend = createFakeBackend()
+  const events = []
+  const glides = []
+  const click = backend.click
+  backend.click = async (args) => {
+    events.push('click')
+    return click(args)
+  }
+
+  const result = await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    glide: async (point) => {
+      events.push('glide')
+      glides.push(point)
+    },
+  })
+
+  assert.equal(result.effect, 'confirmed')
+  assert.deepEqual(events, ['glide', 'click'])
+  assert.equal(glides.length, 1)
+  assert.ok(Math.abs(glides[0].x - 160.77) < 0.01, String(glides[0].x))
+  assert.ok(Math.abs(glides[0].y - 335.18) < 0.01, String(glides[0].y))
+})
+
+test('a failing glide never blocks the action', async () => {
+  const backend = createFakeBackend()
+
+  const result = await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    glide: async () => {
+      throw new Error('cursor unavailable')
+    },
+  })
+
+  assert.equal(result.effect, 'confirmed')
+  assert.equal(actionCalls(backend)[0].method, 'click')
+})
+
+test('drag and element scroll glide to their resolved start points', async () => {
+  const backend = createFakeBackend()
+  const glides = []
+
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'drag',
+    from: { x: 10, y: 20 },
+    to: { x: 30, y: 40 },
+    glide: async (point) => glides.push(point),
+  })
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'scroll',
+    target: { element: 'save' },
+    direction: 'down',
+    glide: async (point) => glides.push(point),
+  })
+
+  assert.deepEqual(glides[0], { x: 10, y: 20 })
+  assert.equal(glides.length, 2)
+  assert.ok(Math.abs(glides[1].x - 160.77) < 0.01)
+  assert.ok(Math.abs(glides[1].y - 335.18) < 0.01)
+})
+
+test('glide is not used for type, key, wait, launch, focus, resize or kill', async () => {
+  const backend = createFakeBackend()
+  let glides = 0
+  const glide = async () => {
+    glides += 1
+  }
+
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'type',
+    target: { element: 'name' },
+    text: 'hello',
+    glide,
+  })
+  await execute(backend, { observation: OBSERVATION, op: 'key', keys: 'return', glide })
+  await execute(backend, { op: 'wait', amount: 0, sleep: async () => {}, glide })
+  await execute(backend, { op: 'launch', target: { name: 'Notepad' }, glide })
+  await execute(backend, { observation: OBSERVATION, op: 'focus', glide })
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'resize',
+    frame: { x: 0, y: 0, width: 100, height: 100 },
+    glide,
+  })
+  await execute(backend, { observation: OBSERVATION, op: 'kill', target: { pid: 999 }, glide })
+
+  assert.equal(glides, 0)
+})

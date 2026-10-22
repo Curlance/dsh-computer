@@ -8,6 +8,9 @@
   "files": [
     "index.js",
     "lib/",
+    "scripts/",
+    "docs/",
+    "skills/",
     "README.md"
   ],
   "scripts": {

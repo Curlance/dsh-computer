@@ -438,6 +438,45 @@ test('cursor.enabled=false skips cursor session setup entirely', async () => {
   ])
 })
 
+test('host glides the cursor before a pointer action when cursor is enabled', async () => {
+  const dir = await tempDir(test)
+  const calls = []
+  const backend = createBackend()
+  backend.getCursorPosition = async () => ({ structured: { x: 0, y: 0 } })
+  backend.moveCursor = async (args) => calls.push({ name: 'moveCursor', args })
+  backend.click = async (args) => {
+    calls.push({ name: 'click', args })
+    return { structured: { effect: 'confirmed' } }
+  }
+  const factory = {
+    async create() {
+      return { backend, close: async () => {} }
+    },
+  }
+  const { ctx, tools } = createCtx()
+  const handle = registerTest(ctx, config(dir), factory)
+
+  assert.equal((await tools[0].execute(OBSERVE, {})).ok, true)
+  const clicked = await tools[0].execute(
+    { action: 'act', op: 'click', target: { element: 'e1' } },
+    { agent: { id: 'agent-1' } },
+  )
+  assert.equal(clicked.ok, true)
+
+  const moves = calls.filter((call) => call.name === 'moveCursor')
+  const clickAt = calls.findIndex((call) => call.name === 'click')
+  const firstMoveAt = calls.findIndex((call) => call.name === 'moveCursor')
+  assert.ok(moves.length > 0, 'cursor did not move')
+  assert.ok(firstMoveAt < clickAt, 'the glide must finish before the click')
+  const landing = moves.at(-1)
+  assert.equal(landing.args.x, 20)
+  assert.equal(landing.args.y, 20)
+  assert.equal(landing.args.target.pid, 100)
+  assert.equal(landing.args.target.window_id, 200)
+
+  await handle.dispose()
+})
+
 test('host results carry only declared keys and object results render as JSON', async () => {
   const dir = await tempDir(test)
   const factory = createFactory()
