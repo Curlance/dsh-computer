@@ -59,7 +59,7 @@ test('renderTaskCommand registers a logon task that repeats every 6 hours', () =
   assert.equal(task.name, 'dsh-computer-updater')
   assert.equal(
     DEFAULT_MANIFEST_URL,
-    'https://github.com/Curlance/dsh-computer-use/releases/latest/download/compat.json',
+    'https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json',
   )
   assert.equal(
     task.command,

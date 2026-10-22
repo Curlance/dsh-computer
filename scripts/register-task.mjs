@@ -18,7 +18,7 @@ import { parseArgs, promisify } from 'node:util'
 
 export const TASK_NAME = 'dsh-computer-updater'
 export const DEFAULT_MANIFEST_URL =
-  'https://github.com/Curlance/dsh-computer-use/releases/latest/download/compat.json'
+  'https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json'
 
 const defaultExec = promisify(nodeExec)
 const DEFAULT_SCRIPT = fileURLToPath(new URL('./update.mjs', import.meta.url))

@@ -22,7 +22,7 @@ Windows 桌面。纯 ESM JavaScript + JSDoc，零构建、零运行时依赖。
 从仓库检出运行（不发布到 npm，也不需要构建）：
 
 ```powershell
-git clone https://github.com/Curlance/dsh-computer-use.git
+git clone https://github.com/Curlance/dsh-computer.git
 cd dsh-computer
 node scripts/install.mjs --dry-run   # 先看计划，不写文件
 node scripts/install.mjs             # 复制版本、写 profile 链接/skill、写托管插件行
@@ -182,7 +182,7 @@ revision=7 window="记事本" space=1456x912
 
 ```powershell
 # 完全退出 DSH 后：
-node scripts/update.mjs --manifest "https://github.com/Curlance/dsh-computer-use/releases/latest/download/compat.json" --check
+node scripts/update.mjs --manifest "https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json" --check
 node scripts/update.mjs --manifest ".../compat.json" --apply
 node scripts/update.mjs --rollback
 ```

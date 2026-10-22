@@ -72,7 +72,7 @@
 
 ```powershell
 # 1) 查看当前版本、DSH 版本与可用版本（不写文件）
-node scripts/update.mjs --manifest "https://github.com/Curlance/dsh-computer-use/releases/latest/download/compat.json" --check
+node scripts/update.mjs --manifest "https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json" --check
 
 # 2) 完全退出 DSH 后应用（会校验 sha256、解包、原子切换、备份 patch）
 node scripts/update.mjs --manifest ".../compat.json" --apply
@@ -140,7 +140,7 @@ node scripts/unregister-task.mjs           # 删除任务
 ```
 
 `--manifest` 默认是
-`https://github.com/Curlance/dsh-computer-use/releases/latest/download/compat.json`，可用
+`https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json`，可用
 `--manifest-url` 覆盖；`--home` 是用户主目录（updater 用 `<home>/.dsh`）。每次触发时，如果 DSH
 正在运行（Windows `tasklist` 或心跳判断），`--apply` 会拒绝切换并退出 1，等下一次（默认 6 小时后）
 再试——所以自动更新只在 DSH 完全退出时生效。`lib/update/notify.js` 的 toast 还没有被更新器调用，
