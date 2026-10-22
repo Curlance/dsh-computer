@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package and release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run tests
+        run: npm test
+
+      # compat.json is generated for this tag only:
+      #   { "versions": [{ "version", "dsh", "tarball", "sha256" }] }
+      # The updater picks the highest version whose `dsh` range matches the
+      # running DSH, and verifies sha256 before writing anything.
+      - name: Pack and build compat.json
+        id: pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne "v$version") {
+            throw "tag $tag does not match package.json version $version"
+          }
+
+          npm pack
+          if ($LASTEXITCODE -ne 0) { throw 'npm pack failed' }
+
+          $tgz = "dsh-computer-$version.tgz"
+          $sha = (Get-FileHash -Algorithm SHA256 -Path $tgz).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            versions = @(
+              [ordered]@{
+                version = $version
+                dsh = '>=0.2.1-rc.2 <0.3.0'
+                tarball = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$tgz"
+                sha256 = $sha
+              }
+            )
+          }
+          $json = ($manifest | ConvertTo-Json -Depth 5) + "`n"
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD 'compat.json'),
+            $json,
+            (New-Object System.Text.UTF8Encoding($false))
+          )
+
+          "tgz=$tgz" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-computer-release
+          path: |
+            dsh-computer-*.tgz
+            compat.json
+          if-no-files-found: error
+
+      # Unsigned by design: sha256 in compat.json protects against corruption,
+      # not against a compromised repository account.
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $tgz = '${{ steps.pack.outputs.tgz }}'
+          $sha = '${{ steps.pack.outputs.sha256 }}'
+          $notes = "dsh-computer $tag (unsigned). tgz: $tgz sha256: $sha. compat.json targets DSH >=0.2.1-rc.2 <0.3.0; the updater verifies sha256 before writing anything. Trust is pinned to this repository's Releases."
+          gh release create $tag $tgz compat.json --title $tag --notes $notes

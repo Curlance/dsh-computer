@@ -105,3 +105,59 @@ and exited `1`.
 
 After both runs: no `mshta.exe` / `notepad.exe` process remained, and no
 `dsh-smoke-*` temp directory remained.
+
+## Task 20 — local CI/docs validation (2026-10-22)
+
+Scope: repository checks only. No GitHub push, no release, no real-machine DSH
+reinstall in this task (the Task 19 smoke above covers the driver path, not the
+standard-session / approval flow).
+
+### Environment
+
+- Repo working tree at `0.1.0`; run on the Windows 11 machine from Task 19.
+- Node.js v24.16.0, npm 11.19.0.
+- Recorded HEAD during the final run: `228f7e3` (other tasks' in-flight changes
+  were present in the working tree; this task changed docs/workflows only).
+
+### Test suite
+
+```powershell
+npm test
+```
+
+Result: **384 tests, 383 pass, 1 skipped, 0 fail** (`duration_ms` ≈ 5.1 s).
+The skipped test is declared skipped in the suite; no test touches the real
+desktop, `~/.dsh` or `cua-driver` (host/driver/clock are injected).
+
+### Package contents
+
+```powershell
+npm pack --dry-run
+```
+
+Tarball `dsh-computer-0.1.0.tgz`: **23 files, 61.3 kB packed / 216.0 kB
+unpacked**, containing only `README.md`, `index.js`, `lib/**` and
+`package.json` (the `files` allowlist). `scripts/`, `docs/`, `skills/` and
+`.github/` are intentionally not in the tarball, so installer/doctor/updater
+and the skill require a repository checkout.
+
+### Workflow syntax
+
+```powershell
+python -c "import yaml; [yaml.safe_load(open(p, encoding='utf-8')) for p in ['.github/workflows/ci.yml', '.github/workflows/release.yml']]"
+```
+
+Both workflows parse as YAML. CI/release were **not** executed: there is no
+remote configured in this checkout and this task does not push. Release
+behavior (tag/version check, `compat.json`, artifact upload, `gh release
+create`) is therefore unverified until the first tagged run.
+
+### Docs cross-check
+
+Read against the current modules (`lib/tool.js`, `lib/host.js`, `lib/act.js`,
+`lib/observe.js`, `lib/policy.js`, `lib/control.js`, `lib/session.js`,
+`lib/audit.js`, `lib/update/*`, `scripts/*`). Documented limitations that are
+true in code today: defineTool DSL cannot express numeric bounds; the runtime
+does not write a health heartbeat; the scheduled updater task does not pass
+`--manifest`/`--apply`; app allow/block lists and the per-minute action limit
+are validated but not enforced; only the primary display is supported.
