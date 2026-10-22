@@ -121,6 +121,89 @@ test('renderTree renders at most 250 elements by default', () => {
   assert.equal(lines.at(-1), '... 截断（共 251 个，显示 250 个）')
 })
 
+test('renderTree notes driver truncation even when the tree fits the limit', () => {
+  const tree = Array.from({ length: 250 }, (_, index) => element({ id: index + 1, frame: null }))
+  const lines = renderTree(
+    observation({ tree, truncated: true, truncationReason: 'budget' }),
+  ).split('\n')
+
+  assert.equal(lines.length, 1 + 250 + 1)
+  assert.equal(lines.at(-1), '... 观察被截断（原因: budget，显示 250 个）')
+})
+
+test('renderTree notes driver truncation below the limit and defaults the reason', () => {
+  const lines = renderTree(
+    observation({ tree: [element({ id: 1, frame: null })], truncated: true }),
+  ).split('\n')
+
+  assert.equal(lines.at(-1), '... 观察被截断（原因: driver，显示 1 个）')
+  assert.equal(
+    renderTree(observation({ tree: [], truncated: true })).split('\n').at(-1),
+    '... 观察被截断（原因: driver，显示 0 个）',
+  )
+})
+
+test('renderTree reports the render slice and driver truncation separately', () => {
+  const tree = Array.from({ length: 5 }, (_, index) => element({ id: index + 1, frame: null }))
+  const lines = renderTree(
+    observation({ tree, truncated: true, truncationReason: 'budget' }),
+    { maxElements: 2 },
+  ).split('\n')
+
+  assert.deepEqual(lines.slice(-2), [
+    '... 截断（共 5 个，显示 2 个）',
+    '... 观察被截断（原因: budget，显示 2 个）',
+  ])
+})
+
+test('renderTree escapes quotes and backslashes in labels and titles', () => {
+  const result = renderTree(
+    observation({
+      title: 'say "hi"',
+      tree: [
+        element({ id: 1, role: 'Button', label: 'Say "hi"', frame: null, actions: [] }),
+        element({ id: 2, role: 'Button', label: 'C:\\tmp\\', frame: null, actions: [] }),
+      ],
+    }),
+  )
+
+  assert.deepEqual(result.split('\n'), [
+    'revision=7 window="say \\"hi\\"" space=1456x910',
+    '[1] Button "Say \\"hi\\""',
+    '[2] Button "C:\\\\tmp\\\\"',
+  ])
+})
+
+test('renderTree collapses CR/LF in labels and titles to spaces', () => {
+  const result = renderTree(
+    observation({
+      title: 'a\r\nb',
+      tree: [element({ id: 1, label: 'one\ntwo\r\nthree', frame: null, actions: [] })],
+    }),
+  )
+
+  assert.equal(
+    result,
+    ['revision=7 window="a b" space=1456x910', '[1] Button "one two three"'].join('\n'),
+  )
+  assert.equal(result.split('\n').length, 2)
+})
+
+test('renderTree replaces lone surrogates so the output stays well formed', () => {
+  const result = renderTree(
+    observation({
+      title: 'A\uD800B',
+      tree: [element({ id: 1, label: 'x\uDC00y', frame: null, actions: [] })],
+    }),
+  )
+
+  assert.equal(
+    result,
+    ['revision=7 window="A\uFFFDB" space=1456x910', '[1] Button "x\uFFFDy"'].join('\n'),
+  )
+  assert.equal(result.isWellFormed(), true)
+})
+
 test('persistImage saves the observation screenshot and maps the attachment', async () => {
   const calls = []
   const attachments = {
