@@ -205,6 +205,33 @@ test('applyMigration backs up the old patch, moves the old package and writes th
   assert.equal(ymlBackups.length, 1)
 })
 
+test('preset-only migration writes an empty-packages manifest and rolls back', async (t) => {
+  const home = await createHome({ version: null })
+  t.after(home.cleanup)
+
+  const plan = await planMigration(planOptions(home))
+  assert.deepEqual(plan.actions.map((action) => action.kind), ['remove-preset', 'write-backup'])
+
+  const nextPatchText = ensurePluginRow(plan.nextPatchText, ROW)
+  const applied = await applyMigration({ ...plan, nextPatchText })
+  assert.equal(applied.writtenPatch, true)
+  assert.equal(await readFile(home.patchPath, 'utf8'), nextPatchText)
+
+  const manifestPath = join(home.pluginsDir, '_backup', 'migration.json')
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+  assert.deepEqual(manifest.packages, [])
+  assert.deepEqual(manifest.links, [])
+
+  // Re-applying the same plan reads the empty-packages manifest again.
+  const again = await applyMigration({ ...plan, nextPatchText })
+  assert.deepEqual(again, { backupPath: plan.backupPath, moved: [], writtenPatch: false })
+
+  const result = await rollbackMigration({ pluginsDir: home.pluginsDir })
+  assert.deepEqual(result.restored, [])
+  assert.equal(await readFile(home.patchPath, 'utf8'), LEGACY_PATCH)
+  await assert.rejects(lstat(manifestPath), { code: 'ENOENT' })
+})
+
 test('rollbackMigration restores the legacy patch, package location and link', async (t) => {
   const home = await createHome()
   t.after(home.cleanup)
@@ -229,6 +256,14 @@ test('rollbackMigration restores the legacy patch, package location and link', a
   await assert.rejects(lstat(join(home.pluginsDir, '_backup', 'migration.json')), { code: 'ENOENT' })
   await assert.rejects(rollbackMigration({ pluginsDir: home.pluginsDir }), /No migration backup found/)
   assert.notEqual(await readFile(home.patchPath, 'utf8'), nextPatchText)
+
+  // The pre-rollback patch is kept as a safety copy before it is overwritten.
+  const backupDir = join(home.pluginsDir, '_backup')
+  const safetyCopies = (await readdir(backupDir)).filter((entry) =>
+    /^patch-pre-rollback-.*\.yml$/.test(entry),
+  )
+  assert.equal(safetyCopies.length, 1)
+  assert.equal(await readFile(join(backupDir, safetyCopies[0]), 'utf8'), nextPatchText)
 
   // The legacy state is detectable again after rollback.
   const replanned = await planMigration(

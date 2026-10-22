@@ -122,6 +122,82 @@ test('ensureLegacyMigration is a no-op without a legacy block', () => {
   assert.deepEqual(ensureLegacyMigration(text), { text, removedPreset: false, removedRows: [] })
 })
 
+test('ensureLegacyMigration removes an old root dsh-computer-use row and keeps the rest', () => {
+  const text = [
+    'plugins:',
+    '  existing: true',
+    '',
+    '- insert:',
+    '    - id: dsh-computer-use',
+    '      name: dsh-computer-use',
+    '      config:',
+    '        id: preset-computer-use',
+    '    - id: user-row',
+    '      name: user-plugin',
+    '      config:',
+    '        id: dsh-computer-use',
+    '',
+    '- insert:',
+    '    - id: untouched',
+    '      name: dsh-computer-use-helper',
+    '',
+  ].join('\n')
+
+  const result = ensureLegacyMigration(text)
+
+  assert.equal(result.removedPreset, false)
+  assert.deepEqual(result.removedRows, ['dsh-computer-use'])
+  assert.equal(
+    result.text,
+    [
+      'plugins:',
+      '  existing: true',
+      '',
+      '- insert:',
+      '    - id: user-row',
+      '      name: user-plugin',
+      '      config:',
+      '        id: dsh-computer-use',
+      '',
+      '- insert:',
+      '    - id: untouched',
+      '      name: dsh-computer-use-helper',
+      '',
+    ].join('\n'),
+  )
+})
+
+test('ensureLegacyMigration removes a root row matched by name only', () => {
+  const text = [
+    '- insert:',
+    '    - id: renamed-row',
+    '      name: dsh-computer-use',
+    '      config:',
+    '        id: dsh-computer-use',
+    '    - id: keep',
+    '      config:',
+    '        id: dsh-computer-use',
+    '',
+  ].join('\n')
+
+  const result = ensureLegacyMigration(text)
+
+  assert.deepEqual(result.removedRows, ['renamed-row'])
+  assert.equal(
+    result.text,
+    ['- insert:', '    - id: keep', '      config:', '        id: dsh-computer-use', ''].join('\n'),
+  )
+})
+
+test('ensureLegacyMigration root row removal is idempotent', () => {
+  const once = ensureLegacyMigration(
+    ['- insert:', '    - id: dsh-computer-use', '      name: dsh-computer-use', ''].join('\n'),
+  )
+  const twice = ensureLegacyMigration(once.text)
+
+  assert.deepEqual(twice, { text: once.text, removedPreset: false, removedRows: [] })
+})
+
 test('ensurePluginRow throws a readable error on a truncated managed block', () => {
   const broken = `${BEGIN_MARKER}\n- insert:\n    - id: dsh-computer\n`
 
