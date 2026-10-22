@@ -106,17 +106,18 @@
 - [ ] **Step 4: 通过**。
 - [ ] **Step 5: 提交**。
 
-### Task 6: 会话与租约
+### Task 6: 会话、控制权与租约
 
 **Files:**
-- Create: `lib/session.js`, `tests/session.test.mjs`
+- Create: `lib/session.js`, `lib/control.js`, `tests/session.test.mjs`, `tests/control.test.mjs`
 
 **Interfaces:**
 - Produces: `createSessionManager({now, ttlMs=120000}) -> {begin(agentId): {sessionId, agentId}, renew(sessionId), end(sessionId), takeover(sessionId,note), resume(sessionId), status(), assertActive(sessionId)}`；错误码 `busy`、`expired`、`unknown_session`、`takeover`。
+- Produces: `createControlGate({now, idleProvider, idleTimeoutMs=3000, gateMs=700, onUnknown='allow'}) -> {status(): Promise<{control:'ready'|'user'|'unknown', lastInputAgeMs:number|null, waitSeconds:number}>, assertAgentAllowed(): Promise<{allowed:boolean, control, waitSeconds, reason?}>, noteAgentAction()}`；`createWindowsIdleProvider({execFile, cacheMs=1000}) -> () => Promise<number|null>`（PowerShell `GetLastInputInfo`，失败 null）。
 
-- [ ] **Step 1: 失败测试**：第一个 begin 成功；第二个 begin 抛 `busy`；TTL 过期后 `assertActive` 抛 `expired` 且可重新 begin；takeover 后 `assertActive` 抛 `takeover`，resume 恢复；end 后租约释放。
+- [ ] **Step 1: 失败测试**：租约 cases（首个 begin 成功、第二个 busy、TTL 过期、takeover/resume、end 释放）；控制门：idle 足够→allowed；idle 不足→`user` + waitSeconds；provider 抛错→`unknown` 且 `onUnknown:'allow'` 放行/`'block'` 拒绝；agent 刚动作 700ms 内 idle 重置不判用户；idle provider 缓存只调用一次。
 - [ ] **Step 2: 运行失败** → FAIL。
-- [ ] **Step 3: 实现**（注入 now，纯内存）。
+- [ ] **Step 3: 实现**（注入 now/idleProvider，纯内存；PowerShell 仅在默认 provider 内）。
 - [ ] **Step 4: 通过**。
 - [ ] **Step 5: 提交**。
 
@@ -168,11 +169,11 @@
 - Create: `lib/observe.js`, `tests/observe.test.mjs`
 
 **Interfaces:**
-- Produces: `createObserver({backend, maxElements, maxImageDimension, ttlMs}) -> {observe(target, {mode,query,includeScreenshot}) -> Promise<Observation>, get(revision)}`；`Observation = {revision, pid, windowId, title, bounds, space:{width,height,scaleX,scaleY}, screenshotPng?, tree: Array<{id,role,label,frame,actions,value?}>}`；`toLocalPoint(frame, observation) -> {x,y}`；`resolveTarget(observation, target) -> {element|point}`。
+- Produces: `createObserver({backend, maxElements, maxImageDimension, ttlMs, budgetMs=1200}) -> {observe(target, {mode,query,includeScreenshot,waitFor}) -> Promise<Observation>, get(revision)}`；`Observation = {revision, pid, windowId, title, bounds, focusedWindow?, space:{width,height,scaleX,scaleY}, screenshotPng?, tree: Array<{id,role,label,frame,actions,value?}>, truncated?}`；`toLocalPoint(frame, observation) -> {x,y}`；`resolveTarget(observation, target) -> {element|point}`；`waitFor(observer, {condition,text,windowName,timeoutMs,intervalMs}) -> {matched, elapsedMs, observation}`（条件：text_exists/active_window/element_exists/element_enabled/focused_element，interval 250ms，timeout ≤120s）。
 
-- [ ] **Step 1: 失败测试**（fixture：window bounds 2880×1800，截图 1456×910）：元素 frame `{x:282,y:644,w:72,h:38}` → local `(142.57,325.58)`；元素 id 保留；`mode:'tree'` 无截图；`mode:'both'` 有截图；过期 revision 拒绝；query 过滤保留祖先。
+- [ ] **Step 1: 失败测试**（fixture：window bounds 2880×1800，截图 1456×910）：元素 frame `{x:282,y:644,w:72,h:38}` → local `(142.57,325.58)`；元素 id 保留；`mode:'tree'` 无截图；`mode:'both'` 有截图；过期 revision 拒绝；query 过滤保留祖先；`waitFor` 首次未命中→轮询命中→返回 elapsed；超时返回 matched:false；非法 interval/timeout 抛错；budget 超时返回 truncated。
 - [ ] **Step 2: 运行失败** → FAIL。
-- [ ] **Step 3: 实现**（纯函数换算 + TTL 缓存）。
+- [ ] **Step 3: 实现**（纯函数换算 + TTL 缓存 + 轮询）。
 - [ ] **Step 4: 通过**。
 - [ ] **Step 5: 提交**。
 
@@ -196,9 +197,9 @@
 - Create: `lib/act.js`, `tests/act.test.mjs`
 
 **Interfaces:**
-- Produces: `execute(backend, {observation, op, target, text, keys, direction, amount, from, to, delivery, observeAfter}) -> Promise<{effect:'confirmed'|'unverifiable'|'refused'|'noop', detail, verification?}>`；`classifyEffect(rawToolResult)`；`buildActionSummary(op, target)`。
+- Produces: `execute(backend, {observation, op, target, text, keys, direction, amount, from, to, frame, delivery, observeAfter}) -> Promise<{effect:'confirmed'|'unverifiable'|'refused'|'noop', detail, verification?}>`；`executeBatch(backend, {steps, stopOnError=true, observation}) -> {effect, results:[{index, effect, detail}], failedAt?}`；`classifyEffect(rawToolResult)`；`buildActionSummary(op, target)`；ops 增加 `focus`（bring_to_front）、`resize`（frame）、`kill`（高风险，由策略层审批）。
 
-- [ ] **Step 1: 失败测试**（fake backend）：click element → 调 click 且 effect confirmed（有 readback）；click 无元素无坐标 → 抛 `MissingTarget`；dialog/password 元素 → `refused`；后台 `background_unavailable` → `unverifiable` 且带建议；type 成功 → effect confirmed；scroll 方向非法 → 抛错。
+- [ ] **Step 1: 失败测试**（fake backend）：click element → 调 click 且 effect confirmed（有 readback）；click 无元素无坐标 → 抛 `MissingTarget`；dialog/password 元素 → `refused`；后台 `background_unavailable` → `unverifiable` 且带建议；type 成功 → effect confirmed；scroll 方向非法 → 抛错；steps 批量顺序执行、某步失败默认停止且 failedAt 正确、stopOnError=false 继续；focus/resize 调后端；kill 被策略层拒绝时不调用后端。
 - [ ] **Step 2: 运行失败** → FAIL。
 - [ ] **Step 3: 实现**（不落盘、不依赖 host）。
 - [ ] **Step 4: 通过**。
@@ -224,9 +225,9 @@
 - Create: `lib/tool.js`, `tests/tool.test.mjs`
 
 **Interfaces:**
-- Produces: `buildComputerTool(deps) -> defineTool 参数对象`（name `computer`，description，parameters JSON Schema）；`dispatch(deps, args, exec) -> Promise<{ok, result, image?}>`；args schema：`action: 'observe'|'act'|'session'`，其余见 spec §4.3；`deps = {backend, observer, policy, sessions, audit, persistImage}`。
+- Produces: `buildComputerTool(deps) -> defineTool 参数对象`（name `computer`，description，parameters JSON Schema）；`dispatch(deps, args, exec) -> Promise<{ok, result, image?}>`；args schema：`action: 'observe'|'act'|'session'`；`observe.waitFor`、`act.steps[]`、`session.status` 的 control/waitSeconds 见 spec §4.3；`deps = {backend, observer, policy, sessions, control, audit, persistImage}`；dispatch 顺序：observe→(waitFor)→render；act→policy→control→session→execute(Batch)→audit；session→status/begin/takeover/resume。
 
-- [ ] **Step 1: 失败测试**：schema 覆盖三类 action；dispatch observe → 返回文本+图片（视觉能力时）；act → policy→session→act→audit 顺序；session begin busy；未知 action 报错；stale revision 报错；audit 记录每次结果。
+- [ ] **Step 1: 失败测试**：schema 覆盖三类 action + waitFor + steps；dispatch observe → 返回文本+图片（视觉能力时）；waitFor 命中返回证据；act 批量顺序执行并逐步审计；control=user 时 act 被拒绝且不调用后端；session begin busy；未知 action 报错；stale revision 报错；audit 记录每次结果。
 - [ ] **Step 2: 运行失败** → FAIL。
 - [ ] **Step 3: 实现**（deps 全注入）。
 - [ ] **Step 4: 通过**。

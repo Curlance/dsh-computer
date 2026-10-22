@@ -129,29 +129,37 @@ src/
   "mode": "screenshot" | "tree" | "both" | "diff",
   "query": "登录",          // 可选：AX 树过滤
   "maxElements": 250,
-  "includeScreenshot": true // 视觉模型；文本模型可关
+  "includeScreenshot": true, // 视觉模型；文本模型可关
+  "waitFor": {              // 可选：单次调用内轮询，命中即返回观察
+    "condition": "text_exists" | "active_window" | "element_exists" | "element_enabled" | "focused_element",
+    "text": "完成", "windowName": "记事本",
+    "timeoutMs": 10000, "intervalMs": 250
+  }
 }
 ```
 
-返回：截图（图片块，标注尺寸/缩放）、窗口 bounds、截图坐标空间说明、AX 行（`[N] role "label" @(x,y)`）、`revision`、可选 diff（新增/变化/删除行 + 失效 id）。
+返回：截图（图片块，标注尺寸/缩放）、窗口 bounds、焦点窗口、截图坐标空间说明、AX 行（`[N] role "label" @(x,y) actions`）、`revision`、可选 diff（新增/变化/删除行 + 失效 id）、`waitFor` 命中条件与耗时。
 
 #### action: `act`
 
 ```jsonc
 {
   "action": "act",
-  "op": "click" | "doubleClick" | "rightClick" | "move" | "type" | "key" | "scroll" | "drag" | "wait" | "launch" | "focus",
+  "op": "click" | "doubleClick" | "rightClick" | "move" | "type" | "key" | "scroll" | "drag" | "wait" | "launch" | "focus" | "resize" | "kill",
   "target": { "element": 12 } | { "x": 640, "y": 360 },
   "text": "hello", "keys": "ctrl+c", "direction": "down", "amount": 3,
+  "frame": { "x": 100, "y": 100, "width": 800, "height": 600 }, // resize
   "from": {"x":..,"y":..}, "to": {"x":..,"y":..},
   "delivery": "auto" | "background" | "foreground",
-  "observeAfter": true
+  "observeAfter": true,
+  "steps": [ /* 可选批量：与单步同构的数组，顺序执行，stopOnError 默认 true */ ]
 }
 ```
 
 - 元素动作优先 AX（后台/可靠）；像素动作走前台输入（需要审批策略允许）。
-- 坐标 = 最近一次 observe 的截图空间（窗口本地）；窗口缩放/多显示器由 observe 返回的 scale 说明。
+- 坐标 = 最近一次 observe 的截图空间（窗口本地）；窗口缩放由 observe 返回的 scale 说明。
 - `observeAfter` 默认 true（或仅接受显式 false）：动作后自动做一次轻量观察/回读，返回 effect + 变化摘要；避免模型盲动作。
+- **批量动作**（借鉴 Windows-MCP MultiSelect/MultiEdit）：`steps[]` 顺序执行，每步独立过策略/审计，返回 per-step 结果；整体 effect 取最严重者；某步失败默认停止（`stopOnError` 可关）。
 - effect 取值：`confirmed` / `unverifiable` / `refused` / `noop`；`unverifiable` 必须带“下一步建议”，不允许当成功。
 
 #### action: `session`
@@ -160,6 +168,8 @@ src/
 { "action": "session", "op": "status" | "begin" | "end" | "takeover" | "resume", "note": "..." }
 ```
 
+- `status` 返回 `{control: 'ready'|'user'|'ai'|'takeover_pending'|'unavailable', waitSeconds, lastInputAgeMs, gate}`（借鉴 Windows-MCP ControlCoordinator）。
+- **控制权门禁**：动作前检查用户空闲时长；`control=user` 且 `lastInputAgeMs < idleTimeoutMs`（默认 3000ms）时拒绝并返回 `waitSeconds`，避免和用户抢桌面；空闲足够后自动回到 `ready`。空闲检测通过 Windows `GetLastInputInfo`（注入式 provider，缓存 ≤1s）；不可用时 `control=unknown`，默认放行但写审计（可配置 `onUnknown:'block'`）。
 - `takeover`：用户接管（或检测到疑似用户交互）→ 暂停自动动作，返回当前观察，提示用户完成后 `resume`。
 - **租约与并发**：全局单 daemon，同一时间只允许一个会话执行动作。每个会话需 `begin` 拿租约（默认 TTL 120s，动作续期）；其他会话调用 `act` 返回 `busy`，不排队、不阻塞等待。审计记录 session id / agent id；审批归属发起会话。
 - **可见范围**：根插件行对标准会话、子 agent、后台 agent 都可见；子 agent 同样受租约约束。若 DSH 提供按 agent 限制工具的 API，首期默认只对主会话开放、子 agent 需显式开启（避免并发抢桌面），实现时以真实 API 为准。
@@ -179,7 +189,8 @@ src/
 - **硬阻断（不可配置绕过）**：密码框输入、UAC/安全桌面、未观察快照的盲动作、过期 revision 动作。操作系统安全桌面/提权确认一律不触碰。
 - **可配置项**：敏感应用名单（默认含系统设置/任务管理器/终端等，可白名单放行，放行动作写审计）、审批模式（默认 ask；可调严格/宽松，但不提供“高风险全自动”预设）。
 - **审批**：走 `ctx.approval`；审批请求带 action 摘要 + 目标窗口/元素 + 观察 digest；拒绝返回 `refused` 并附原因。
-- **接管（A+B 已定，不引入原生输入监听）**：显式 `session.takeover`；启发式检测（前台窗口变化、目标窗口失焦、动作前 revision 不一致、真实指针位置变化）→ 标记“疑似用户交互”，暂停自动动作并提示。**如实说明：这不是 100% 自动让路**；真正自动监听全局输入需要原生模块/权限，留到 C 期前作为可选增强。
+- **接管（A+B 已定，不引入原生输入监听）**：显式 `session.takeover`；`session.status` 的 control 状态机（ready/user/ai/takeover_pending）+ 用户空闲门禁作为第一道保护；启发式检测（前台窗口变化、目标窗口失焦、动作前 revision 不一致、真实指针位置变化）作为补充。**如实说明：这不是 100% 自动让路**；真正自动监听全局输入需要原生模块/权限，留到 C 期前作为可选增强。
+- **输入归属启发式（借鉴 Windows-MCP 的 input ledger，降级实现）**：无原生钩子时，用“最近一次 agent 动作时间”抵消自身 SendInput 对空闲计时的影响（动作后 700ms 内不因 idle 重置判定为用户接管）；该启发式写进审计与文档，不宣称等价于物理输入监听。
 - **审计**：JSONL 记录 session/agent/action/observation digest/effect/approval/耗时/配置放宽；默认 `~/.dsh/computer/audit.jsonl`；不记录输入明文（只记长度/摘要），截图默认不落盘。
 - **限流**：每分钟动作数、连续失败熔断；后端不可用时工具返回可操作错误而不是崩溃。
 
@@ -217,6 +228,27 @@ src/
 - observe（截图+树）< 1.5s；元素点击 < 800ms；像素动作 < 1.2s；动作后回读 < 1.5s（本机 2880×1800）。
 - 观察缓存/差分：同一窗口连续 observe 用 diff 减少 token 与截图体积。
 - 图片按模型能力返回；文本模型不付图片 token。
+- 树预算：`maxElements` + 单次观察超时（默认 1200ms）双限，超限返回 `truncated` 与提示，不拖死任务。
+- WaitFor 轮询间隔默认 250ms、上限 120s；命中即返回，避免模型侧 sleep 循环。
+
+### 4.8 Windows-MCP 借鉴与取舍
+
+参考 [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP)（MIT，Python MCP，9.8k★；21 个工具、ControlCoordinator、WaitFor、MultiEdit/MultiSelect、Snapshot/Screenshot 双路径、树预算）：
+
+**采纳（A+B）**
+- **控制权状态机 + 空闲门禁**：session status 暴露 control/waitSeconds；动作前检查用户空闲，避免抢桌面。
+- **WaitFor**：observe 内轮询 text_exists / active_window / element_exists / element_enabled / focused_element。
+- **批量动作**：act.steps[] 顺序执行、逐步审计，降低往返延迟（对标 MultiSelect/MultiEdit）。
+- **观察增强**：交互元素 actions、焦点窗口、树预算/截断提示；保留 screenshot/tree/both 快路径。
+- **App 管理**：launch/focus/resize/kill（kill 高风险，走审批）。
+- **看门狗思路**：后端健康探针 + 断线重连 + 连续失败熔断（已在 4.6/4.4）。
+
+**不采纳（或留到 C 期）**
+- Shell/FileSystem/Registry/Clipboard/Scrape/Process：DSH 已有更合适的专用工具，插件不重复暴露高风险能力。
+- DisplayInventory：Cua Driver 无对应工具；多显示器坐标换算留 C 期浏览器/多屏专项。
+- 原生输入钩子/input ledger：需要原生模块或驱动支持，A+B 用启发式替代并如实标注限制。
+- OAuth/IP allowlist/CORS/TLS：Windows-MCP 面向远程 MCP 服务；本插件是本地进程，不需要。
+
 
 ## 5. 里程碑与验收（A+B）
 
@@ -263,6 +295,8 @@ src/
 - 迁移旧 0.4.1：删旧预设/旧根行，保留旧包备份，可回滚；新工具名 `computer` 避免重名。
 - 不做 UI 面板；`doctor` + 审计日志 + 工具返回作为可观测面。
 - 新仓库建议 `dsh-computer`（独立历史），旧 `dsh-computer-use` 保留为 legacy。
+- 借鉴 Windows-MCP：增加控制权状态机 + 用户空闲门禁、observe.waitFor、act.steps 批量动作、App focus/resize/kill；不复制其 Shell/FileSystem/Registry/Clipboard/Scrape/Process 工具面。
+- 空闲检测用注入式 `GetLastInputInfo` provider（PowerShell 一次性调用 + 缓存），不可用时 `unknown` 默认放行并审计；自身输入用“最近动作时间”启发式抵消，不宣称等价物理输入监听。
 
 ## 8. 下一步
 
