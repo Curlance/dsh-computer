@@ -1,3 +1,11 @@
 node_modules/
 .superpowers/
 *.log
+
+dist/
+coverage/
+*.tgz
+.env
+.env.*
+*.tmp
+.DS_Store

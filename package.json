@@ -26,5 +26,10 @@
   "engines": {
     "node": ">=24.0.0",
     "dsh": ">=0.2.1-rc.2 <0.3.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Curlance/dsh-computer.git"
+  },
+  "homepage": "https://github.com/Curlance/dsh-computer"
 }
