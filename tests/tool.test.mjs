@@ -43,6 +43,7 @@ function fixture({
   beginError,
   renewError,
   observation = OBSERVATION(),
+  observeImplementation,
 } = {}) {
   const log = []
   const auditEvents = []
@@ -163,6 +164,9 @@ function fixture({
     calls: [],
     async observe(target, options = {}) {
       observer.calls.push({ target, options })
+      if (typeof observeImplementation === 'function') {
+        return observeImplementation(target, options)
+      }
       if (options.waitFor !== undefined) {
         return { ...observation, waitFor: { matched: true, elapsedMs: 12 } }
       }
@@ -447,7 +451,7 @@ test('a missed waitFor is flagged and audited as unverifiable', async () => {
   assert.equal(f.auditEvents[0].effect, 'unverifiable')
 })
 
-test('act order is policy -> control -> execute -> audit, with observed:true', async () => {
+test('act order is control -> policy -> execute -> audit, with observed:true', async () => {
   const f = fixture()
   await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
   f.log.length = 0
@@ -469,9 +473,9 @@ test('act order is policy -> control -> execute -> audit, with observed:true', a
   const controlAt = f.log.indexOf('control.assert')
   const executeAt = f.log.indexOf('backend.click')
   const auditAt = f.log.indexOf('audit')
-  assert.ok(policyAt >= 0, 'policy was not consulted')
-  assert.ok(policyAt < controlAt, 'control must run after policy')
-  assert.ok(controlAt < executeAt, 'execute must run after control')
+  assert.ok(controlAt >= 0, 'control was not consulted')
+  assert.ok(controlAt < policyAt, 'policy must run after control')
+  assert.ok(policyAt < executeAt, 'execute must run after policy')
   assert.ok(executeAt < auditAt, 'audit must run after execute')
   assert.ok(f.log.includes('note'), 'noteAgentAction was not called')
 
@@ -539,7 +543,7 @@ test('control=user refuses the action before the backend runs', async () => {
   assert.equal(f.auditEvents[0].effect, 'refused')
 })
 
-test('policy denial refuses the action before control or the backend run', async () => {
+test('policy denial refuses the action after control but before the backend run', async () => {
   const f = fixture({
     policyDecision: { allowed: false, reason: 'approval-denied', risk: 'high' },
   })
@@ -558,7 +562,8 @@ test('policy denial refuses the action before control or the backend run', async
   assert.equal(out.result.denied.by, 'policy')
   assert.equal(out.result.denied.reason, 'approval-denied')
   assert.equal(out.result.denied.risk, 'high')
-  assert.ok(!f.log.includes('control.assert'), 'control must not run after a policy denial')
+  assert.equal(f.control.calls, 1, 'control gate must run before policy')
+  assert.equal(f.policyCalls.length, 1)
   assert.equal(f.backendCalls.length, 0)
   assert.equal(f.auditEvents[0].decision, 'denied')
   assert.equal(f.auditEvents[0].risk, 'high')
@@ -865,7 +870,7 @@ test('a first-step denial stops the batch, audits it and never calls the backend
   assert.equal(out.result.denied.by, 'policy')
   assert.equal(f.backendCalls.length, 0)
   assert.equal(f.policyCalls.length, 1)
-  assert.equal(f.control.calls, 0)
+  assert.equal(f.control.calls, 1)
   assert.equal(f.auditEvents.length, 1)
   assert.equal(f.auditEvents[0].action, 'click')
   assert.equal(f.auditEvents[0].risk, 'high')
@@ -976,7 +981,7 @@ test('a throwing policy becomes a denied act with its own audit record', async (
   assert.equal(out.result.denied.by, 'policy')
   assert.match(out.result.denied.reason, /policy offline/)
   assert.equal(f.backendCalls.length, 0)
-  assert.equal(f.control.calls, 0)
+  assert.equal(f.control.calls, 1)
   assert.equal(f.auditEvents.length, 1)
   assert.equal(f.auditEvents[0].decision, 'denied')
   assert.equal(f.auditEvents[0].effect, 'refused')
@@ -1049,4 +1054,96 @@ test('unknown actions and unknown session ops throw readable errors', async () =
     dispatch(f.deps, { action: 'session', op: 'teleport' }),
     /Unknown session op: teleport/,
   )
+})
+
+test('a control denial is decided before policy, so no approval or rate budget is used', async () => {
+  const f = fixture({
+    controlDecision: { allowed: false, control: 'user', waitSeconds: 1 },
+  })
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.result.denied.by, 'control')
+  assert.equal(f.policyCalls.length, 0, 'policy must not run after a control denial')
+  assert.equal(f.log.includes('policy'), false)
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].decision, 'denied')
+})
+
+test('an aborted exec.signal refuses act before policy, control or backend', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+  const controller = new AbortController()
+  controller.abort()
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1', signal: controller.signal },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.code, 'cancelled')
+  assert.equal(out.result.effect, 'refused')
+  assert.match(out.result.detail, /cancelled/)
+  assert.equal(f.policyCalls.length, 0)
+  assert.equal(f.control.calls, 0)
+  assert.equal(f.backendCalls.length, 0)
+})
+
+test('a non-aborted signal reaches policy and the backend action still runs', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+  const controller = new AbortController()
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1', signal: controller.signal },
+  )
+
+  assert.equal(out.ok, true)
+  assert.equal(out.result.effect, 'confirmed')
+  assert.equal(f.backendCalls.length, 1)
+  assert.equal(f.policyCalls[0].signal, controller.signal)
+})
+
+test('aborting during waitFor stops polling and returns refused', async () => {
+  const controller = new AbortController()
+  let polls = 0
+  const f = fixture({
+    observeImplementation: async () => {
+      polls += 1
+      if (polls === 1) controller.abort()
+      return OBSERVATION()
+    },
+  })
+
+  const out = await dispatch(
+    f.deps,
+    {
+      action: 'observe',
+      target: { kind: 'active' },
+      waitFor: { condition: 'text_exists', text: '完成', timeoutMs: 1000, intervalMs: 1 },
+    },
+    { agentId: 'agent-1', signal: controller.signal },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.code, 'cancelled')
+  assert.match(out.result, /cancelled/)
+  assert.equal(polls, 1)
 })

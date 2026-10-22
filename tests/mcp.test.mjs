@@ -220,6 +220,7 @@ test('an unanswered request rejects with TimeoutError', async () => {
   await assert.rejects(pending, (error) => {
     assert.ok(error instanceof TimeoutError)
     assert.equal(error.name, 'TimeoutError')
+    assert.equal(error.code, 'timeout')
     assert.match(error.message, /timed out after 25ms/)
     assert.match(error.message, /tools\/call/)
     return true

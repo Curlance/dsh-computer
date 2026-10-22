@@ -9,6 +9,8 @@ import {
   executeBatch,
 } from '../lib/act.js'
 import { createPolicy } from '../lib/policy.js'
+import { ToolCallError } from '../lib/backend/cua.js'
+import { TimeoutError } from '../lib/backend/mcp.js'
 
 const PID = 100
 const WINDOW_ID = 200
@@ -150,6 +152,28 @@ test('classifyEffect treats an ambiguous thrown error as unverifiable', () => {
   assert.equal(classifyEffect(new Error('suspected_noop')), 'unverifiable')
 })
 
+test('classifyEffect treats a driver timeout as unverifiable, never refused', () => {
+  const timedOut = new ToolCallError(
+    'click',
+    new TimeoutError('MCP request timed out after 15000ms (tools/call)', {
+      timeoutMs: 15000,
+      method: 'tools/call',
+    }),
+  )
+  assert.equal(timedOut.code, 'timeout')
+  assert.equal(timedOut.cause.code, 'timeout')
+  assert.equal(classifyEffect(timedOut), 'unverifiable')
+  assert.equal(
+    classifyEffect(Object.assign(new Error('request failed'), { cause: { code: 'timeout' } })),
+    'unverifiable',
+  )
+  assert.equal(
+    classifyEffect(Object.assign(new Error('request failed'), { cause: new Error('Timed out') })),
+    'unverifiable',
+  )
+  assert.equal(classifyEffect({ ok: false, error: { code: 'timeout', message: 'x' } }), 'unverifiable')
+})
+
 test('classifyEffect keeps an ambiguous background failure unverifiable', () => {
   assert.equal(classifyEffect({ ok: false, code: 'background_unavailable' }), 'unverifiable')
   assert.equal(
@@ -265,8 +289,7 @@ test('an unknown element is a readable error and never calls the backend', async
   assert.equal(backend.calls.length, 0)
 })
 
-test('password fields and dialogs are refused without a backend call', async () => {
-  const backend = createFakeBackend()
+test('password fields and dialogs are refused without a backend call', async () => {  const backend = createFakeBackend()
 
   const password = await execute(backend, {
     observation: OBSERVATION,
@@ -293,6 +316,54 @@ test('password fields and dialogs are refused without a backend call', async () 
   assert.equal(typed.effect, 'refused')
   assert.match(typed.detail, /password/)
 
+  assert.equal(backend.calls.length, 0)
+})
+
+test('a resolved editable password field is refused before the backend', async () => {
+  const elements = stateElements()
+  elements.push({
+    element_token: 'pwfield',
+    role: 'Edit',
+    label: 'Password',
+    frame: { x: 740, y: 700, w: 200, h: 40 },
+    actions: ['set_value'],
+  })
+  const observation = observationWith(elements)
+  const backend = createFakeBackend()
+
+  const click = await execute(backend, {
+    observation,
+    op: 'click',
+    target: { element: 'pwfield' },
+  })
+  assert.equal(click.effect, 'refused')
+  assert.match(click.detail, /password-field/)
+
+  const typed = await execute(backend, {
+    observation,
+    op: 'type',
+    target: { element: 'pwfield' },
+    text: 'secret',
+  })
+  assert.equal(typed.effect, 'refused')
+  assert.match(typed.detail, /password-field/)
+  assert.equal(backend.calls.length, 0)
+})
+
+test('an aborted signal refuses the action before the backend runs', async () => {
+  const backend = createFakeBackend()
+  const controller = new AbortController()
+  controller.abort()
+
+  const result = await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    signal: controller.signal,
+  })
+
+  assert.equal(result.effect, 'refused')
+  assert.match(result.detail, /cancelled/)
   assert.equal(backend.calls.length, 0)
 })
 
@@ -757,6 +828,35 @@ test('a backend throw becomes a refused result, not a thrown action', async () =
   assert.equal('verification' in result, false)
 })
 
+test('a driver timeout is unverifiable with a re-observe advice', async () => {
+  const timedOut = new ToolCallError(
+    'click',
+    new TimeoutError('MCP request timed out after 15000ms (tools/call)', {
+      timeoutMs: 15000,
+      method: 'tools/call',
+    }),
+  )
+  const backend = createFakeBackend({
+    results: {
+      click: () => {
+        throw timedOut
+      },
+    },
+  })
+
+  const result = await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    observeAfter: false,
+  })
+
+  assert.equal(result.effect, 'unverifiable')
+  assert.equal(result.advice, '结果未知，先重新 observe 再决定是否重试')
+  assert.match(result.detail, /timed out/)
+  assert.doesNotMatch(result.detail, /refused/)
+})
+
 test('background_unavailable is unverifiable and suggests a foreground retry', async () => {
   const backend = createFakeBackend({
     results: { typeText: { ok: false, code: 'background_unavailable' } },
@@ -844,7 +944,7 @@ test('observeAfter false skips readback and omits verification', async () => {
   assert.deepEqual(actionCalls(backend).map((call) => call.method), ['click'])
 })
 
-test('a failed readback keeps the action effect and reports an unobserved verification', async () => {
+test('a failed readback downgrades a confirmed action to unverifiable', async () => {
   const backend = createFakeBackend({
     results: {
       getWindowState: () => {
@@ -859,9 +959,11 @@ test('a failed readback keeps the action effect and reports an unobserved verifi
     target: { element: 'save' },
   })
 
-  assert.equal(result.effect, 'confirmed')
+  assert.equal(result.effect, 'unverifiable')
+  assert.match(result.advice, /screen_observe|重新/)
   assert.equal(result.verification.observed, false)
   assert.match(result.verification.error, /window closed/)
+  assert.match(result.detail, /readback unavailable/)
 })
 
 test('readback normalizes raw backend rows before comparing', async () => {

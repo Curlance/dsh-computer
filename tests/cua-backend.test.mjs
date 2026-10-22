@@ -395,6 +395,10 @@ test('RPC and ambiguous timeout errors are wrapped without retry', async () => {
     await assert.rejects(backend.listWindows(), (error) => {
       assert.ok(error instanceof ToolCallError)
       assert.equal(error.cause, failure)
+      if (failure instanceof TimeoutError) {
+        assert.equal(error.code, 'timeout')
+        assert.equal(error.cause.code, 'timeout')
+      }
       return true
     })
     assert.equal(factoryCalls, 0, `${failure.name} must not be retried`)
