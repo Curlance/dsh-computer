@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { exec, execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -15,13 +14,13 @@ import {
   renderTaskCommand,
 } from '../scripts/register-task.mjs'
 import {
-  isTaskMissing,
   main as unregisterMain,
   renderDeleteCommand,
   unregisterTask,
 } from '../scripts/unregister-task.mjs'
 
 const run = promisify(execFile)
+const runCommand = promisify(exec)
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const REGISTER = join(REPO_ROOT, 'scripts', 'register-task.mjs')
 const UNREGISTER = join(REPO_ROOT, 'scripts', 'unregister-task.mjs')
@@ -35,6 +34,20 @@ function noExec() {
   }
 }
 
+/** Decode the UTF-16LE `-EncodedCommand` payload of a registration command. */
+function decodeWrapper(command) {
+  const match = /-EncodedCommand ([A-Za-z0-9+/=]+)$/.exec(command)
+  assert.ok(match, `expected an -EncodedCommand wrapper, got: ${command}`)
+  return Buffer.from(match[1], 'base64').toString('utf16le')
+}
+
+/** Read a single-quoted PowerShell literal assigned to `$name`. */
+function psLiteral(script, name) {
+  const match = new RegExp(`(?:^|; )\\$${name} = '((?:[^']|'')*)'(?=;|$)`).exec(script)
+  assert.ok(match, `expected $${name} to be assigned a literal`)
+  return match[1].replace(/''/g, "'")
+}
+
 test('renderTaskCommand registers a logon task that repeats every 6 hours', () => {
   const task = renderTaskCommand({ home: HOME, scriptPath: SCRIPT })
 
@@ -43,24 +56,48 @@ test('renderTaskCommand registers a logon task that repeats every 6 hours', () =
 
   assert.equal(task.name, TASK_NAME)
   assert.equal(task.name, 'dsh-computer-updater')
-  assert.ok(task.command.includes(scriptPath), 'command carries the absolute script path')
-  assert.ok(task.command.includes(homePath), 'command carries the absolute home path')
-  assert.ok(task.command.includes(`"${scriptPath}"`), 'command quotes spaced paths for CreateProcess')
-  assert.ok(task.command.includes(`"${homePath}"`))
+  assert.equal(
+    task.command,
+    `"${resolve(process.execPath)}" "${scriptPath}" --home "${homePath}"`,
+  )
 
   // One wrapper registers both triggers: schtasks /RI is not valid with ONLOGON,
   // and a second /Create would replace the first trigger.
   assert.equal(task.schedule.length, 1)
-  const schedule = task.schedule[0]
-  assert.match(schedule, /New-ScheduledTaskTrigger -AtLogOn/)
-  assert.match(schedule, /New-TimeSpan -Hours 6/)
-  assert.ok(schedule.includes(scriptPath))
-  assert.ok(schedule.includes(homePath))
+  const wrapper = decodeWrapper(task.schedule[0])
+  assert.match(wrapper, /New-ScheduledTaskTrigger -AtLogOn/)
+  assert.match(wrapper, /New-TimeSpan -Hours 6/)
+  assert.doesNotMatch(wrapper, /\/RI\b/)
+
+  // Regression: `-Command` strips literal double quotes, so the wrapper must
+  // build them at runtime and contain none of its own.
+  assert.ok(wrapper.includes('$q = [char]34'))
   assert.ok(
-    schedule.includes(`-Argument '"${scriptPath}" --home "${homePath}"'`),
-    'action arguments double-quote spaced paths',
+    wrapper.includes("$argument = $q + $script + $q + ' --home ' + $q + $homePath + $q"),
+    'action argument is assembled with the runtime quote character',
   )
-  assert.doesNotMatch(schedule, /\/RI\b/)
+  assert.ok(!wrapper.includes('"'), 'wrapper carries no literal double quotes')
+
+  // Single source of truth: the wrapper's literals reconstruct exactly the
+  // action command that renderTaskCommand exposes and tests assert on.
+  assert.equal(
+    `"${psLiteral(wrapper, 'node')}" "${psLiteral(wrapper, 'script')}" --home "${psLiteral(wrapper, 'homePath')}"`,
+    task.command,
+  )
+})
+
+test('renderTaskCommand keeps spaced paths quoted in the encoded action', () => {
+  const spacedHome = join(tmpdir(), 'dsh task home')
+  const spacedScript = join(tmpdir(), 'dsh task script', 'update.mjs')
+  const task = renderTaskCommand({ home: spacedHome, scriptPath: spacedScript })
+  const wrapper = decodeWrapper(task.schedule[0])
+
+  assert.equal(
+    `"${psLiteral(wrapper, 'script')}" --home "${psLiteral(wrapper, 'homePath')}"`,
+    `"${resolve(spacedScript)}" --home "${resolve(spacedHome)}"`,
+  )
+  assert.ok(task.command.includes(`"${resolve(spacedScript)}"`))
+  assert.ok(task.command.includes(`"${resolve(spacedHome)}"`))
 })
 
 test('renderTaskCommand honors a custom interval and resolves relative paths', () => {
@@ -70,7 +107,7 @@ test('renderTaskCommand honors a custom interval and resolves relative paths', (
     intervalHours: 12,
   })
 
-  assert.match(task.schedule[0], /New-TimeSpan -Hours 12/)
+  assert.match(decodeWrapper(task.schedule[0]), /New-TimeSpan -Hours 12/)
   assert.ok(task.command.includes(resolve('relative-home')))
   assert.ok(task.command.includes(resolve('scripts/update.mjs')))
 })
@@ -108,7 +145,7 @@ test('registerTask runs the logon registration command with a bounded timeout', 
   assert.match(logs.join('\n'), /registered: dsh-computer-updater/)
 })
 
-test('registerTask dry-run prints the command without invoking schtasks', async () => {
+test('registerTask dry-run prints the encoded command without invoking the scheduler', async () => {
   const logs = []
   const result = await registerTask({
     home: HOME,
@@ -119,13 +156,13 @@ test('registerTask dry-run prints the command without invoking schtasks', async 
   })
 
   assert.equal(result.dryRun, true)
-  const output = logs.join('\n')
-  assert.match(output, /New-ScheduledTaskTrigger -AtLogOn/)
-  assert.ok(output.includes(resolve(SCRIPT)))
-  assert.ok(output.includes(resolve(HOME)))
+  const wrapper = decodeWrapper(logs.join('\n'))
+  assert.match(wrapper, /New-ScheduledTaskTrigger -AtLogOn/)
+  assert.ok(wrapper.includes(resolve(SCRIPT)))
+  assert.ok(wrapper.includes(resolve(HOME)))
 })
 
-test('registerTask rejects when schtasks fails', async () => {
+test('registerTask rejects when the scheduler fails', async () => {
   await assert.rejects(
     registerTask({
       home: HOME,
@@ -165,8 +202,9 @@ test('register CLI --dry-run prints the command without touching the real schedu
     { cwd: REPO_ROOT },
   )
 
-  assert.match(stdout, /New-ScheduledTaskTrigger -AtLogOn/)
-  assert.ok(stdout.includes(resolve(SCRIPT)))
+  const wrapper = decodeWrapper(stdout.trim())
+  assert.match(wrapper, /New-ScheduledTaskTrigger -AtLogOn/)
+  assert.ok(wrapper.includes(resolve(SCRIPT)))
 })
 
 test('register CLI exits 1 for invalid arguments', async () => {
@@ -180,14 +218,70 @@ test('register CLI exits 1 for invalid arguments', async () => {
   )
 })
 
-test('renderDeleteCommand deletes the updater task', () => {
+test('encoded wrapper composes a quoted action argument in real PowerShell', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('Windows PowerShell only')
+    return
+  }
+
+  const spacedHome = join(tmpdir(), 'dsh task home')
+  const spacedScript = join(tmpdir(), 'dsh task script', 'update.mjs')
+  const task = renderTaskCommand({ home: spacedHome, scriptPath: spacedScript })
+  const wrapper = decodeWrapper(task.schedule[0])
+
+  // Run everything except the registration call, then print the action that
+  // would have been registered. This exercises the same encoded payload without
+  // touching the real task scheduler.
+  const probe = wrapper.replace(
+    /Register-ScheduledTask[^;]*/,
+    "Write-Output ($action.Execute + '|' + $action.Arguments)",
+  )
+  assert.notEqual(probe, wrapper, 'probe replaced the registration call')
+  const encoded = Buffer.from(probe, 'utf16le').toString('base64')
+
+  let stdout
+  try {
+    const result = await run(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      { timeout: 30_000, windowsHide: true },
+    )
+    stdout = result.stdout
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      t.skip('powershell.exe unavailable')
+      return
+    }
+    throw error
+  }
+
   assert.equal(
-    renderDeleteCommand(),
-    'schtasks.exe /Delete /TN "dsh-computer-updater" /F',
+    stdout.trim(),
+    `${resolve(process.execPath)}|"${resolve(spacedScript)}" --home "${resolve(spacedHome)}"`,
+    'spaced paths keep their quotes in the registered action argument',
   )
 })
 
-test('unregisterTask dry-run prints the delete command without invoking schtasks', async () => {
+test('renderDeleteCommand removes the task through PowerShell without localised text', () => {
+  const command = renderDeleteCommand()
+
+  assert.match(command, /^powershell\.exe .* -Command "/)
+  assert.ok(
+    command.includes(
+      "Get-ScheduledTask -TaskName 'dsh-computer-updater' -ErrorAction SilentlyContinue",
+    ),
+  )
+  assert.ok(
+    command.includes(
+      "Unregister-ScheduledTask -TaskName 'dsh-computer-updater' -Confirm:$false -ErrorAction Stop",
+    ),
+  )
+  assert.ok(!/schtasks/i.test(command), 'does not depend on schtasks')
+  assert.ok(!/(cannot find|does not exist|找不到|不存在)/i.test(command))
+  assert.ok(command.includes("'absent'; exit 0"), 'absence is signalled by the script itself')
+})
+
+test('unregisterTask dry-run prints the delete command without invoking the scheduler', async () => {
   const logs = []
   const result = await unregisterTask({
     dryRun: true,
@@ -205,6 +299,7 @@ test('unregisterTask deletes the task', async () => {
   const result = await unregisterTask({
     exec: async (...args) => {
       calls.push(args)
+      return { stdout: 'removed\r\n', stderr: '' }
     },
     log: (line) => logs.push(line),
   })
@@ -216,16 +311,10 @@ test('unregisterTask deletes the task', async () => {
   assert.match(logs.join('\n'), /unregistered: dsh-computer-updater/)
 })
 
-test('unregisterTask treats an already-absent task as success', async () => {
+test('unregisterTask reports an absent task from the script marker, not localised text', async () => {
   const logs = []
-  const error = Object.assign(new Error('Command failed'), {
-    stderr: 'ERROR: The system cannot find the file specified.',
-  })
-
   const result = await unregisterTask({
-    exec: async () => {
-      throw error
-    },
+    exec: async () => ({ stdout: 'absent\r\n', stderr: '' }),
     log: (line) => logs.push(line),
   })
 
@@ -233,17 +322,13 @@ test('unregisterTask treats an already-absent task as success', async () => {
   assert.match(logs.join('\n'), /already absent/i)
 })
 
-test('isTaskMissing does not treat a missing schtasks binary as an absent task', () => {
-  const error = Object.assign(new Error('spawn schtasks.exe ENOENT'), { code: 'ENOENT' })
-  assert.equal(isTaskMissing(error), false)
-})
-
-test('unregisterTask rethrows failures that are not an absent task', async () => {
-  const error = Object.assign(new Error('Access is denied.'), { stderr: 'Access is denied.' })
-  assert.equal(isTaskMissing(error), false)
+test('unregisterTask rethrows real failures even when the message looks localised', async () => {
+  // The old implementation matched English/Chinese "not found" text; absence is
+  // now decided by the script's own marker and exit code.
+  const error = Object.assign(new Error('找不到指定的文件'), { stderr: '找不到指定的文件' })
   await assert.rejects(
     unregisterTask({ exec: async () => Promise.reject(error), log: () => {} }),
-    /Access is denied\./,
+    /找不到指定的文件/,
   )
 })
 
@@ -262,12 +347,54 @@ test('unregister CLI reports an actionable error and returns exit code 1', async
   assert.match(output, /failed to delete/)
   assert.match(output, /dsh-computer-updater/)
   assert.match(output, /Access is denied\./)
+  assert.match(output, /powershell\.exe/)
+})
+
+test('unregister CLI exits 0 when the task is already absent', async () => {
+  const logs = []
+  const code = await unregisterMain({
+    exec: async () => ({ stdout: 'absent', stderr: '' }),
+    log: (line) => logs.push(line),
+    error: () => {},
+  })
+
+  assert.equal(code, 0)
+  assert.match(logs.join('\n'), /already absent: dsh-computer-updater/)
 })
 
 test('unregister CLI --dry-run prints only the delete command', async () => {
   const { stdout } = await run(process.execPath, [UNREGISTER, '--dry-run'], { cwd: REPO_ROOT })
 
   assert.equal(stdout.trim(), renderDeleteCommand())
+})
+
+test('delete command reports an absent task without localised text', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('Windows PowerShell only')
+    return
+  }
+
+  // A synthetic task name proves the script parses and reports absence without
+  // ever touching the real updater task.
+  const command = renderDeleteCommand().replaceAll(
+    `'${TASK_NAME}'`,
+    "'dsh-computer-updater-probe-absent'",
+  )
+  assert.notEqual(command, renderDeleteCommand(), 'probe retargets the task name')
+
+  let stdout
+  try {
+    const result = await runCommand(command, { timeout: 30_000, windowsHide: true })
+    stdout = result.stdout
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      t.skip('powershell.exe unavailable')
+      return
+    }
+    throw error
+  }
+
+  assert.equal(stdout.trim(), 'absent')
 })
 
 test('notify returns false without invoking exec off Windows', async () => {
@@ -335,6 +462,21 @@ test('notify never throws when no logger is supplied', async () => {
   })
 
   assert.equal(shown, false)
+})
+
+test('notify flattens a lone carriage return too', async () => {
+  let script = ''
+  await notify({
+    title: 't',
+    message: 'line one\rline two',
+    platform: 'win32',
+    exec: async (...args) => {
+      script = args[1][args[1].indexOf('-Command') + 1]
+    },
+  })
+
+  assert.ok(script.includes("'line one line two'"))
+  assert.ok(!script.includes('\r'))
 })
 
 test('notify clamps an unknown level instead of interpolating it', async () => {

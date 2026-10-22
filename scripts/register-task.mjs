@@ -35,6 +35,12 @@ Options:
  * `ONLOGON`, and a second `/Create` replaces the first), so the registration
  * wrapper creates the logon trigger and the 6-hour repetition trigger together.
  *
+ * The wrapper is passed with `-EncodedCommand`: PowerShell strips literal double
+ * quotes out of a `-Command` string, which used to drop the quoting from spaced
+ * script/home paths. The wrapper builds its action argument from `$q`, and
+ * `command` is derived from the same resolved paths, so the tested action string
+ * and the registered action cannot drift apart.
+ *
  * @param {{home: string, scriptPath: string, intervalHours?: number}} options
  * @returns {{name: string, command: string, schedule: string[]}}
  */
@@ -52,11 +58,22 @@ export function renderTaskCommand({ home, scriptPath, intervalHours = 6 } = {}) 
   const nodePath = resolve(process.execPath)
   const scriptPathAbs = resolve(scriptPath)
   const homePathAbs = resolve(home)
-  const command = `"${nodePath}" "${scriptPathAbs}" --home "${homePathAbs}"`
   // The action argument is parsed by CreateProcess, so paths need double quotes.
-  const argument = psQuote(`"${scriptPathAbs}" --home "${homePathAbs}"`)
+  const command = `"${nodePath}" "${scriptPathAbs}" --home "${homePathAbs}"`
+  // `$home` is PowerShell's read-only automatic variable, hence `$homePath`.
+  const wrapper = [
+    '$q = [char]34',
+    `$node = ${psQuote(nodePath)}`,
+    `$script = ${psQuote(scriptPathAbs)}`,
+    `$homePath = ${psQuote(homePathAbs)}`,
+    `$argument = $q + $script + $q + ' --home ' + $q + $homePath + $q`,
+    '$action = New-ScheduledTaskAction -Execute $node -Argument $argument',
+    '$logon = New-ScheduledTaskTrigger -AtLogOn',
+    `$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours ${intervalHours})`,
+    `Register-ScheduledTask -TaskName ${psQuote(TASK_NAME)} -Action $action -Trigger @($logon, $repeat) -Force | Out-Null`,
+  ].join('; ')
   const schedule = [
-    `powershell.exe -NoProfile -NonInteractive -Command "$action = New-ScheduledTaskAction -Execute ${psQuote(nodePath)} -Argument ${argument}; $logon = New-ScheduledTaskTrigger -AtLogOn; $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours ${intervalHours}); Register-ScheduledTask -TaskName ${psQuote(TASK_NAME)} -Action $action -Trigger @($logon, $repeat) -Force | Out-Null"`,
+    `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(wrapper, 'utf16le').toString('base64')}`,
   ]
 
   return { name: TASK_NAME, command, schedule }

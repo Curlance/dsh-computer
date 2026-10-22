@@ -17,22 +17,23 @@ const RUN_TIMEOUT_MS = 15_000
 const USAGE = `Usage: node scripts/unregister-task.mjs [options]
 
 Options:
-  --dry-run         Print the schtasks delete command without deleting anything
+  --dry-run         Print the PowerShell delete command without deleting anything
   -h, --help        Show this help
 `
 
-/** The command that deletes the updater task. */
+/**
+ * The command that deletes the updater task. Existence is checked with
+ * `Get-ScheduledTask` and reported through the script's own `absent` marker, so
+ * nothing depends on the English/Chinese wording of scheduler errors.
+ */
 export function renderDeleteCommand() {
-  return `schtasks.exe /Delete /TN "${TASK_NAME}" /F`
-}
-
-/** True when schtasks reports that the task does not exist. */
-export function isTaskMissing(error) {
-  if (error?.code === 'ENOENT') return false
-  const text = [error?.stderr, error?.stdout, error?.message]
-    .filter((part) => typeof part === 'string' && part.length > 0)
-    .join('\n')
-  return /cannot find|does not exist|no such file|找不到|不存在/i.test(text)
+  const script = [
+    `$existing = Get-ScheduledTask -TaskName '${TASK_NAME}' -ErrorAction SilentlyContinue`,
+    "if ($null -eq $existing) { 'absent'; exit 0 }",
+    `Unregister-ScheduledTask -TaskName '${TASK_NAME}' -Confirm:$false -ErrorAction Stop`,
+    "'removed'",
+  ].join('; ')
+  return `powershell.exe -NoProfile -NonInteractive -Command "${script}"`
 }
 
 /**
@@ -57,17 +58,13 @@ export async function unregisterTask({
     return { removed: false, alreadyAbsent: false, dryRun: true }
   }
 
-  try {
-    await exec(command, { timeout: RUN_TIMEOUT_MS, windowsHide: true })
-    log(`unregistered: ${TASK_NAME}`)
-    return { removed: true, alreadyAbsent: false, dryRun: false }
-  } catch (error) {
-    if (isTaskMissing(error)) {
-      log(`already absent: ${TASK_NAME}`)
-      return { removed: false, alreadyAbsent: true, dryRun: false }
-    }
-    throw error
+  const result = await exec(command, { timeout: RUN_TIMEOUT_MS, windowsHide: true })
+  if (String(result?.stdout ?? '').trim() === 'absent') {
+    log(`already absent: ${TASK_NAME}`)
+    return { removed: false, alreadyAbsent: true, dryRun: false }
   }
+  log(`unregistered: ${TASK_NAME}`)
+  return { removed: true, alreadyAbsent: false, dryRun: false }
 }
 
 /**
@@ -101,7 +98,7 @@ export async function main({
       `unregister-task: failed to delete "${TASK_NAME}": ${unregisterError.message}`,
     )
     error(
-      'Check that schtasks.exe is available and that this account may delete scheduled tasks, then retry.',
+      'Check that powershell.exe (Windows PowerShell 5.1) is available and that this account may delete scheduled tasks, then retry.',
     )
     return 1
   }
