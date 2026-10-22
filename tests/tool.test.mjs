@@ -40,6 +40,7 @@ function fixture({
   clickResult,
   typeResult,
   beginError,
+  renewError,
   observation = OBSERVATION(),
 } = {}) {
   const log = []
@@ -56,16 +57,24 @@ function fixture({
     takeoverCalls: [],
     resumeCalls: [],
     beginError,
+    renewError,
     begin(agentId) {
       log.push('session.begin')
       sessions.beginCalls.push(agentId)
       if (sessions.beginError) throw sessions.beginError
+      if (sessions.current !== null) {
+        throw Object.assign(
+          new Error(`session ${sessions.current.sessionId} holds the lease`),
+          { code: 'busy' },
+        )
+      }
       sessions.current = { sessionId: 'session-1', agentId }
       return { ...sessions.current }
     },
     renew(sessionId) {
       log.push('session.renew')
       sessions.renewCalls.push(sessionId)
+      if (sessions.renewError) throw sessions.renewError
       return {
         sessionId,
         agentId: sessions.current?.agentId ?? 'agent',
@@ -102,13 +111,14 @@ function fixture({
           takeover: null,
         }
       }
+      const takeover = sessions.current.takeover ?? null
       return {
-        active: true,
-        state: 'active',
+        active: takeover === null,
+        state: takeover === null ? 'active' : 'takeover',
         ...sessions.current,
         expiresAt: 0,
         remainingMs: 60000,
-        takeover: null,
+        takeover,
       }
     },
   }
@@ -290,6 +300,7 @@ test('observe renders the tree, persists the screenshot and audits the result', 
   assert.equal(f.observer.calls[0].target.kind, 'active')
   assert.equal(f.observer.calls[0].options.mode, 'both')
   assert.equal(f.auditEvents.length, 1)
+  assert.ok(f.log.indexOf('persistImage') < f.log.indexOf('audit'))
   assert.equal(f.auditEvents[0].action, 'observe')
   assert.equal(f.auditEvents[0].decision, 'allowed')
   assert.equal(f.auditEvents[0].effect, 'confirmed')
@@ -548,6 +559,7 @@ test('session begin busy is reported as a failed dispatch, not an exception', as
   assert.equal(out.ok, false)
   assert.match(String(out.result), /busy/)
   assert.equal(out.code, 'busy')
+  assert.equal(out.denied, true)
 })
 
 test('session end, takeover and resume reach the lease manager', async () => {
@@ -569,6 +581,340 @@ test('session end, takeover and resume reach the lease manager', async () => {
   const end = await dispatch(f.deps, { action: 'session', op: 'end' }, { agentId: 'agent-1' })
   assert.equal(end.ok, true)
   assert.deepEqual(f.sessions.endCalls, ['session-1'])
+})
+
+test('act refuses a lease held by another agent before policy, control or backend', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.sessions.current = { sessionId: 'session-1', agentId: 'agent-2' }
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.denied, true)
+  assert.equal(out.code, 'busy')
+  assert.match(String(out.result), /held by agent-2/)
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.policyCalls.length, 0)
+  assert.equal(f.control.calls, 0)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].action, 'click')
+  assert.equal(f.auditEvents[0].decision, 'denied')
+  assert.equal(f.auditEvents[0].effect, 'refused')
+})
+
+test('act during a user takeover fails without policy, control or backend calls', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.sessions.current = {
+    sessionId: 'session-1',
+    agentId: 'agent-1',
+    takeover: { at: 1, note: 'user typing' },
+  }
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.denied, true)
+  assert.equal(out.code, 'busy')
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.policyCalls.length, 0)
+  assert.equal(f.control.calls, 0)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].decision, 'denied')
+})
+
+test('a second agent cannot act on the first agent lease', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+
+  const first = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1' },
+  )
+  assert.equal(first.ok, true)
+
+  f.log.length = 0
+  f.auditEvents.length = 0
+  f.backendCalls.length = 0
+  f.policyCalls.length = 0
+
+  const second = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-2' },
+  )
+
+  assert.equal(second.ok, false)
+  assert.equal(second.code, 'busy')
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.policyCalls.length, 0)
+  assert.deepEqual(f.sessions.renewCalls, ['session-1'])
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].decision, 'denied')
+})
+
+test('a renew failure is audited and never reaches the backend', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.sessions.current = { sessionId: 'session-1', agentId: 'agent-1' }
+  f.sessions.renewError = Object.assign(new Error('lease expired'), { code: 'expired' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.code, 'expired')
+  assert.equal(out.denied, true)
+  assert.match(String(out.result), /lease expired/)
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.policyCalls.length, 0)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].decision, 'denied')
+})
+
+test('session end, takeover and resume reject a different agent', async () => {
+  const f = fixture()
+  f.sessions.current = { sessionId: 'session-1', agentId: 'agent-1' }
+
+  for (const op of ['end', 'takeover', 'resume']) {
+    const out = await dispatch(f.deps, { action: 'session', op }, { agentId: 'agent-2' })
+    assert.equal(out.ok, false, `${op} must be refused`)
+    assert.equal(out.code, 'busy')
+    assert.equal(out.denied, true)
+    assert.match(String(out.result), /held by agent-1/)
+  }
+
+  assert.deepEqual(f.sessions.endCalls, [])
+  assert.deepEqual(f.sessions.takeoverCalls, [])
+  assert.deepEqual(f.sessions.resumeCalls, [])
+})
+
+test('a first-step denial stops the batch, audits it and never calls the backend', async () => {
+  const f = fixture({
+    policyImplementation: ({ action }) =>
+      action.op === 'click'
+        ? { allowed: false, reason: 'approval-denied', risk: 'high' }
+        : { allowed: true, reason: 'allowed', risk: 'low' },
+  })
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    {
+      action: 'act',
+      steps: [
+        { op: 'click', target: { element: 'save' } },
+        { op: 'type', target: { element: 'name' }, text: 'hello' },
+      ],
+    },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.result.effect, 'refused')
+  assert.equal(out.result.failedAt, 0)
+  assert.equal(out.result.results.length, 1)
+  assert.equal(out.result.results[0].index, 0)
+  assert.equal(out.result.results[0].effect, 'refused')
+  assert.equal(out.result.denied.by, 'policy')
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.policyCalls.length, 1)
+  assert.equal(f.control.calls, 0)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].action, 'click')
+  assert.equal(f.auditEvents[0].risk, 'high')
+  assert.equal(f.auditEvents[0].decision, 'denied')
+  assert.equal(f.auditEvents[0].effect, 'refused')
+})
+
+test('an invalid batch step is audited as refused and keeps earlier results', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    {
+      action: 'act',
+      steps: [
+        { op: 'click', target: { element: 'save' } },
+        { op: 'click' },
+        { op: 'type', target: { element: 'name' }, text: 'hello' },
+      ],
+    },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.result.effect, 'refused')
+  assert.equal(out.result.failedAt, 1)
+  assert.deepEqual(
+    out.result.results.map((entry) => entry.effect),
+    ['confirmed', 'refused'],
+  )
+  assert.match(out.result.results[1].detail, /requires a target/)
+  assert.deepEqual(f.backendCalls.map((entry) => entry.op), ['click'])
+  assert.equal(f.auditEvents.length, 2)
+  assert.equal(f.auditEvents[0].action, 'click')
+  assert.equal(f.auditEvents[0].effect, 'confirmed')
+  assert.equal(f.auditEvents[1].action, 'click')
+  assert.equal(f.auditEvents[1].effect, 'refused')
+  assert.equal(f.auditEvents[1].target, undefined)
+})
+
+test('batch gating keeps each step audit aligned when an earlier step is invalid', async () => {
+  const f = fixture({
+    policyImplementation: ({ action }) =>
+      action.op === 'kill'
+        ? { allowed: false, reason: 'approval-denied', risk: 'high' }
+        : { allowed: true, reason: 'allowed', risk: 'low' },
+  })
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    {
+      action: 'act',
+      stopOnError: false,
+      steps: [
+        { op: 'click' },
+        { op: 'kill', target: { pid: 100 } },
+        { op: 'click', target: { element: 'save' } },
+      ],
+    },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.result.effect, 'refused')
+  assert.deepEqual(
+    out.result.results.map((entry) => [entry.index, entry.effect]),
+    [
+      [0, 'refused'],
+      [1, 'refused'],
+      [2, 'confirmed'],
+    ],
+  )
+  assert.equal(out.result.failedAt, undefined)
+  assert.deepEqual(f.backendCalls.map((entry) => entry.op), ['click'])
+  assert.equal(f.auditEvents.length, 3)
+  assert.deepEqual(
+    f.auditEvents.map((event) => [event.action, event.decision, event.effect]),
+    [
+      ['click', 'allowed', 'refused'],
+      ['kill', 'denied', 'refused'],
+      ['click', 'allowed', 'confirmed'],
+    ],
+  )
+})
+
+test('a throwing policy becomes a denied act with its own audit record', async () => {
+  const f = fixture({
+    policyImplementation: () => {
+      throw new Error('policy offline')
+    },
+  })
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'click', target: { element: 'save' } },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, false)
+  assert.equal(out.result.denied.by, 'policy')
+  assert.match(out.result.denied.reason, /policy offline/)
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.control.calls, 0)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].decision, 'denied')
+  assert.equal(f.auditEvents[0].effect, 'refused')
+})
+
+test('batch wait steps are gated before they reach the backend', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', steps: [{ op: 'wait', amount: 1 }] },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, true)
+  assert.equal(out.result.effect, 'noop')
+  assert.equal(f.policyCalls.length, 1)
+  assert.equal(f.policyCalls[0].action.op, 'wait')
+  assert.equal(f.control.calls, 1)
+  assert.equal(f.backendCalls.length, 0)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].action, 'wait')
+  assert.equal(f.auditEvents[0].decision, 'allowed')
+  assert.equal(f.auditEvents[0].effect, 'noop')
+})
+
+test('a single wait action is gated by policy and control too', async () => {
+  const f = fixture()
+  await dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' })
+  f.log.length = 0
+  f.auditEvents.length = 0
+
+  const out = await dispatch(
+    f.deps,
+    { action: 'act', op: 'wait', amount: 1 },
+    { agentId: 'agent-1' },
+  )
+
+  assert.equal(out.ok, true)
+  assert.equal(out.result.effect, 'noop')
+  assert.equal(f.policyCalls.length, 1)
+  assert.equal(f.policyCalls[0].action.op, 'wait')
+  assert.equal(f.control.calls, 1)
+  assert.equal(f.auditEvents.length, 1)
+  assert.equal(f.auditEvents[0].action, 'wait')
+  assert.equal(f.auditEvents[0].decision, 'allowed')
+})
+
+test('a failed audit leaves no reusable last observation', async () => {
+  const f = fixture()
+  f.audit.record = async () => {
+    throw new Error('audit failed')
+  }
+
+  await assert.rejects(dispatch(f.deps, OBSERVE_ARGS, { agentId: 'agent-1' }), /audit failed/)
+  await assert.rejects(
+    dispatch(f.deps, { action: 'act', op: 'click', target: { element: 'save' } }, { agentId: 'agent-1' }),
+    /current observation/,
+  )
+  assert.equal(f.backendCalls.length, 0)
 })
 
 test('unknown actions and unknown session ops throw readable errors', async () => {
