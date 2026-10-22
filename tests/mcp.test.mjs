@@ -305,6 +305,23 @@ test('line transport parses partial chunks and multiple messages per chunk', asy
   transport.close()
 })
 
+test('line transport decodes a multibyte character split across chunks', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const transport = createLineTransport({ stdin: input, stdout: output })
+  const messages = []
+  transport.onMessage((message) => messages.push(message))
+
+  const payload = Buffer.from('{"jsonrpc":"2.0","id":3,"result":{"title":"A中B"}}\n', 'utf8')
+  const split = payload.indexOf(Buffer.from('中', 'utf8')) + 1 // inside 中: 0xE4 | 0xB8 0xAD
+  input.write(payload.subarray(0, split))
+  input.write(payload.subarray(split))
+  await tick()
+
+  assert.deepEqual(messages, [{ jsonrpc: '2.0', id: 3, result: { title: 'A中B' } }])
+  transport.close()
+})
+
 test('line transport drops malformed lines and keeps parsing', async () => {
   const input = new PassThrough()
   const output = new PassThrough()
