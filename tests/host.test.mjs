@@ -141,17 +141,30 @@ test('register registers one computer tool without starting the backend', async 
   assert.equal(tool.name, 'computer')
   assert.equal(typeof tool.description, 'string')
   assert.ok(tool.description.length > 0)
-  assert.deepEqual(tool.parameters.properties.action.enum, ['observe', 'act', 'session'])
-  assert.deepEqual(tool.parameters.properties.op.enum.slice(-5), [
+  // buildComputerTool exposes the dsh-tools author DSL, not raw JSON Schema.
+  assert.equal(tool.parameters.type, undefined)
+  assert.equal(tool.parameters.required, undefined)
+  assert.equal(tool.parameters.action.required, true)
+  assert.deepEqual(tool.parameters.action.enum, ['observe', 'act', 'session'])
+  assert.deepEqual(tool.parameters.op.enum.slice(-5), [
     'status',
     'begin',
     'end',
     'takeover',
     'resume',
   ])
+  assert.equal(tool.parameters.waitFor.additionalProperties, false)
+  assert.equal(tool.parameters.waitFor.properties.condition.required, true)
+  assert.equal(tool.parameters.steps.items.properties.op.required, true)
   assert.equal(tool.output.schema.properties.ok.type, 'boolean')
-  assert.ok(tool.output.schema.properties.result)
+  assert.equal(tool.output.schema.properties.ok.required, true)
+  assert.ok(tool.output.schema.properties.result.oneOf)
   assert.ok(tool.output.schema.properties.image)
+  assert.equal(tool.output.schema.properties.code.type, 'string')
+  assert.equal(tool.output.schema.properties.denied.type, 'boolean')
+  assert.equal(tool.output.schema.properties.sessionId.type, 'string')
+  assert.equal(tool.output.schema.properties.agentId.type, 'string')
+  assert.equal(tool.output.schema.additionalProperties, false)
   assert.equal(typeof tool.output.render, 'function')
   // Lazy: registration must not touch the driver.
   assert.equal(factory.state.creates, 0)
@@ -362,6 +375,99 @@ test('register validates the config before touching the host', async () => {
     /Invalid approvals\.mode/,
   )
   assert.equal(tools.length, 0)
+})
+
+test('concurrent calls keep each call approval agent through serialized executions', async () => {
+  const dir = await tempDir(test)
+  const factory = createFactory()
+  const { ctx, tools, approvalRequests } = createCtx()
+  const inner = ctx.approval.request
+  ctx.approval.request = async (request) => {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    return inner(request)
+  }
+  const handle = registerTest(ctx, config(dir), factory)
+  const agentA = { id: 'shared-agent', label: 'A' }
+  const agentB = { id: 'shared-agent', label: 'B' }
+
+  await tools[0].execute(OBSERVE, { agent: agentA })
+
+  const [first, second] = await Promise.all([
+    tools[0].execute({ action: 'act', op: 'click', target: { x: 10, y: 10 } }, { agent: agentA }),
+    tools[0].execute({ action: 'act', op: 'click', target: { x: 10, y: 10 } }, { agent: agentB }),
+  ])
+
+  assert.equal(first.ok, true)
+  assert.equal(second.ok, true)
+  assert.equal(approvalRequests.length, 2)
+  assert.deepEqual(
+    approvalRequests.map((request) => request.agent.label),
+    ['A', 'B'],
+  )
+
+  await handle.dispose()
+})
+
+test('cursor.enabled=false skips cursor session setup entirely', async () => {
+  const dir = await tempDir(test)
+
+  async function run(enabled) {
+    const calls = []
+    const backend = createBackend()
+    backend.startSession = async (options) => calls.push({ name: 'startSession', options })
+    backend.setAgentCursorEnabled = async (value) =>
+      calls.push({ name: 'setAgentCursorEnabled', value })
+    backend.setAgentCursorMotion = async (options) =>
+      calls.push({ name: 'setAgentCursorMotion', options })
+    const { ctx, tools } = createCtx()
+    const handle = registerTest(ctx, config(dir, { cursor: { enabled } }), {
+      create: async () => ({ backend, close: async () => {} }),
+    })
+
+    const result = await tools[0].execute(OBSERVE, {})
+    assert.equal(result.ok, true)
+    await handle.dispose()
+    return calls.map((call) => call.name)
+  }
+
+  assert.deepEqual(await run(false), [])
+  assert.deepEqual(await run(true), [
+    'startSession',
+    'setAgentCursorEnabled',
+    'setAgentCursorMotion',
+  ])
+})
+
+test('host results carry only declared keys and object results render as JSON', async () => {
+  const dir = await tempDir(test)
+  const factory = createFactory()
+  const { ctx, tools } = createCtx()
+  const handle = registerTest(ctx, config(dir), factory)
+
+  await tools[0].execute({ action: 'session', op: 'begin' }, { agent: { id: 'agent-1' } })
+  const refused = await tools[0].execute(
+    { action: 'session', op: 'end' },
+    { agent: { id: 'agent-2' } },
+  )
+  assert.deepEqual(Object.keys(refused).sort(), [
+    'agentId',
+    'code',
+    'denied',
+    'ok',
+    'result',
+    'sessionId',
+  ])
+  assert.equal(refused.denied, true)
+  assert.equal(refused.code, 'busy')
+
+  const status = await tools[0].execute({ action: 'session', op: 'status' }, {})
+  assert.deepEqual(Object.keys(status).sort(), ['ok', 'result'])
+  const blocks = tools[0].output.render({}, { ...status, extra: 'not-declared' })
+  assert.equal(blocks.length, 1)
+  assert.equal(blocks[0].type, 'text')
+  assert.equal(blocks[0].text, JSON.stringify(status.result))
+
+  await handle.dispose()
 })
 
 test('resolveDriverCommand prefers CUA_DRIVER_BIN, then PATH, then install locations', () => {

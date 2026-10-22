@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { buildComputerTool, dispatch } from '../lib/tool.js'
+import { buildComputerTool, dispatch, toDshParameters } from '../lib/tool.js'
+import { OUTPUT } from '../lib/host.js'
 
 const OBSERVATION = () => ({
   revision: 4,
@@ -235,12 +236,14 @@ test('buildComputerTool exposes the unified schema for observe, act and session'
   assert.equal(typeof tool.execute, 'function')
 
   const parameters = tool.parameters
-  assert.equal(parameters.type, 'object')
-  assert.deepEqual(parameters.required, ['action'])
-  assert.deepEqual(parameters.properties.action.enum, ['observe', 'act', 'session'])
+  assert.equal(parameters.type, undefined)
+  assert.equal(parameters.required, undefined)
+  assert.equal(parameters.action.required, true)
+  assert.deepEqual(parameters.action.enum, ['observe', 'act', 'session'])
 
-  const waitFor = parameters.properties.waitFor
+  const waitFor = parameters.waitFor
   assert.equal(waitFor.type, 'object')
+  assert.equal(waitFor.additionalProperties, false)
   assert.deepEqual(waitFor.properties.condition.enum, [
     'text_exists',
     'active_window',
@@ -248,13 +251,14 @@ test('buildComputerTool exposes the unified schema for observe, act and session'
     'element_enabled',
     'focused_element',
   ])
+  assert.equal(waitFor.properties.condition.required, true)
   assert.equal(waitFor.properties.timeoutMs.type, 'integer')
 
-  assert.equal(parameters.properties.mode.enum.includes('both'), true)
-  assert.equal(parameters.properties.maxElements.type, 'integer')
-  assert.equal(parameters.properties.includeScreenshot.type, 'boolean')
+  assert.equal(parameters.mode.enum.includes('both'), true)
+  assert.equal(parameters.maxElements.type, 'integer')
+  assert.equal(parameters.includeScreenshot.type, 'boolean')
 
-  const actOps = parameters.properties.op.enum
+  const actOps = parameters.op.enum
   for (const op of ['click', 'type', 'key', 'scroll', 'wait', 'launch', 'kill']) {
     assert.equal(actOps.includes(op), true, `missing act op ${op}`)
   }
@@ -262,13 +266,110 @@ test('buildComputerTool exposes the unified schema for observe, act and session'
     assert.equal(actOps.includes(op), true, `missing session op ${op}`)
   }
 
-  const steps = parameters.properties.steps
+  const steps = parameters.steps
   assert.equal(steps.type, 'array')
   assert.equal(steps.items.type, 'object')
-  assert.deepEqual(steps.items.required, ['op'])
+  assert.equal(steps.items.additionalProperties, false)
+  assert.equal(steps.items.properties.op.required, true)
   assert.equal(steps.items.properties.op.enum.includes('click'), true)
   assert.equal(steps.items.properties.op.enum.includes('status'), false)
-  assert.equal(parameters.properties.delivery.enum.includes('foreground'), true)
+  assert.equal(parameters.delivery.enum.includes('foreground'), true)
+})
+
+function findValues(value, key) {
+  const found = []
+  const walk = (node) => {
+    if (Array.isArray(node)) {
+      for (const entry of node) walk(entry)
+      return
+    }
+    if (node === null || typeof node !== 'object') return
+    if (Object.hasOwn(node, key)) found.push(node[key])
+    for (const entry of Object.values(node)) walk(entry)
+  }
+  walk(value)
+  return found
+}
+
+test('toDshParameters emits the dsh-tools author DSL property map', () => {
+  const parameters = toDshParameters({
+    type: 'object',
+    additionalProperties: false,
+    required: ['needed'],
+    properties: {
+      needed: { type: 'string', minLength: 2, description: 'inline required' },
+      free: { type: 'object', additionalProperties: true },
+      closed: {
+        type: 'object',
+        required: ['x'],
+        properties: { x: { type: 'number', minimum: 0 } },
+      },
+      choice: {
+        oneOf: [{ type: 'string', enum: ['a', 'b'] }, { type: 'array', items: { type: 'integer' } }],
+      },
+    },
+  })
+
+  assert.deepEqual(parameters, {
+    needed: { type: 'string', description: 'inline required', required: true },
+    free: { type: 'object', additionalProperties: true },
+    closed: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { x: { type: 'number', required: true } },
+    },
+    choice: {
+      oneOf: [{ type: 'string', enum: ['a', 'b'] }, { type: 'array', items: { type: 'integer' } }],
+    },
+  })
+  assert.throws(() => toDshParameters(null), /schema object/)
+})
+
+test('every converted object declares additionalProperties and required stays inline', () => {
+  const parameters = buildComputerTool(fixture().deps).parameters
+
+  assert.equal(parameters.type, undefined)
+  assert.equal(parameters.properties, undefined)
+  assert.equal(parameters.required, undefined)
+
+  const required = findValues(parameters, 'required')
+  assert.ok(required.length > 0)
+  assert.equal(
+    required.every((value) => value === true),
+    true,
+    'required must only appear inline as true',
+  )
+  assert.equal(
+    findValues(parameters, 'additionalProperties').length,
+    findValues(parameters, 'type').filter((type) => type === 'object').length,
+  )
+
+  for (const key of ['minLength', 'minItems', 'minimum', 'maximum']) {
+    assert.equal(findValues(parameters, key).length, 0, `${key} is not in the DSL`)
+  }
+  assert.deepEqual(parameters.keys.oneOf, [
+    { type: 'string' },
+    { type: 'array', items: { type: 'string' } },
+  ])
+})
+
+test('the real dsh-tools compiler accepts the emitted parameter and output DSL', async (t) => {
+  let dsl
+  try {
+    dsl = await import('@deepseek-ai/dsh-tools')
+  } catch (error) {
+    t.skip(
+      `@deepseek-ai/dsh-tools is not dynamically importable here (${error?.code ?? error?.message}); ` +
+        'install the peer dependency to exercise the real compiler',
+    )
+    return
+  }
+  assert.equal(typeof dsl.parameterSchemaSpecToJsonSchema, 'function')
+  assert.equal(typeof dsl.valueSchemaSpecToJsonSchema, 'function')
+
+  const tool = buildComputerTool(fixture().deps)
+  assert.doesNotThrow(() => dsl.parameterSchemaSpecToJsonSchema(tool.parameters))
+  assert.doesNotThrow(() => dsl.valueSchemaSpecToJsonSchema(OUTPUT.schema))
 })
 
 test('tool.execute delegates to dispatch', async () => {
