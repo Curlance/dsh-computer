@@ -112,6 +112,29 @@ test('getWindowState defaults to the elements tree and omits unset options', asy
   })
 })
 
+test('getWindowState passes screenshot sizing options through', async () => {
+  const client = createFakeClient()
+  const backend = createCuaBackend({ client })
+
+  await backend.getWindowState({
+    pid: 10,
+    windowId: 20,
+    includeScreenshot: true,
+    maxImageDimension: 1456,
+    screenshotOutFile: 'C:\\Temp\\shot.png',
+  })
+
+  assert.deepEqual(client.calls[0].args, {
+    pid: 10,
+    window_id: 20,
+    include_screenshot: true,
+    tree_format: 'elements',
+    max_image_dimension: 1456,
+    screenshot_out_file: 'C:\\Temp\\shot.png',
+    session: DEFAULT_SESSION,
+  })
+})
+
 test('action methods pass snake_case fields through unchanged and add the session label', async () => {
   const client = createFakeClient()
   const backend = createCuaBackend({ client, session: 'actions' })
@@ -270,6 +293,39 @@ test('cursor methods reuse the session label established by startSession', async
   assert.deepEqual(client.calls[5].args, { session: 'run-9' })
 })
 
+test('startSession wraps a string cursor theme in the driver theme object', async () => {
+  const client = createFakeClient()
+  const backend = createCuaBackend({ client })
+
+  await backend.startSession({ label: 'run-10', theme: 'cua.dark' })
+  await backend.listApps()
+
+  assert.deepEqual(client.calls[0].args, {
+    session: 'run-10',
+    cursor_theme: { theme_id: 'cua.dark' },
+  })
+  assert.deepEqual(client.calls[1].args, { session: 'run-10' })
+})
+
+test('a failed startSession does not advance the session label used by later calls', async () => {
+  const failure = new McpToolError('session label already in use', { toolName: 'start_session' })
+  const client = createFakeClient((name) => {
+    if (name === 'start_session') throw failure
+    return textResult('ok')
+  })
+  const backend = createCuaBackend({ client, session: 'original' })
+
+  await assert.rejects(backend.startSession({ label: 'replacement' }), (error) => {
+    assert.ok(error instanceof ToolCallError)
+    assert.equal(error.cause, failure)
+    return true
+  })
+  assert.deepEqual(client.calls[0].args, { session: 'replacement' })
+
+  await backend.listApps()
+  assert.deepEqual(client.calls[1].args, { session: 'original' })
+})
+
 test('isError from the client becomes ToolCallError with tool name and cause', async () => {
   const failure = new McpToolError('window 20 does not belong to pid 10', {
     toolName: 'get_window_state',
@@ -377,6 +433,34 @@ test('a transport error retries once through createClient and uses the replaceme
   await backend.listApps()
   assert.equal(replacement.calls.length, 2)
   assert.equal(first.calls.length, 1)
+})
+
+test('a rejecting close() on the old transport still allows the one retry', async () => {
+  const transportFailure = new McpError('MCP transport stream ended')
+  const first = createFakeClient(() => {
+    throw transportFailure
+  })
+  first.close = async () => {
+    first.state.closes += 1
+    throw new Error('already closed')
+  }
+  const replacement = createFakeClient(() => textResult('recovered'))
+  let factoryCalls = 0
+  const backend = createCuaBackend({
+    client: first,
+    createClient: () => {
+      factoryCalls += 1
+      return replacement
+    },
+  })
+
+  const result = await backend.listWindows()
+
+  assert.equal(factoryCalls, 1)
+  assert.equal(first.state.closes, 1)
+  assert.equal(replacement.state.starts, 1)
+  assert.equal(replacement.calls.length, 1)
+  assert.deepEqual(result, { text: 'recovered', structured: undefined })
 })
 
 test('a transport error without a client factory is wrapped without retry', async () => {
