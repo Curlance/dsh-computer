@@ -550,3 +550,10 @@ Installed into the live desktop profile with `node scripts/install.mjs --home C:
 - Headless standard-session check was attempted (`dsh headless "..."`); it cannot run here because the headless profile has no `DEEPSEEK_API_KEY` configured and no per-profile plugin link. The desktop session itself is the verified host-load path; approval-UI behaviour still needs a manual interactive check.
 
 Known limitation: `doctor` version detection uses `DSH_VERSION`, `DSH_APP_PACKAGE_JSON`, `<dshHome>/version`, DSH manifests, `dsh --version`, then the running `DeepSeek Harness.exe` FileVersion; a stopped app with no PATH shim and no version file still reports unknown.
+
+### Reinstall after final fixes — 2026-10-22 20:42
+
+- Re-ran `node scripts/install.mjs --home C:\Users\b1778 --profile desktop`: package copied over `plugins/dsh-computer/0.1.0`, link and patch unchanged, skill refreshed.
+- `doctor`: 5/5 checks ok (DSH 0.2.1-rc.2, compat, driver, managed patch row, link).
+- Installed copy contains the final backend-reset/close fixes; full suite 422 tests / 421 pass / 1 conditional skip / 0 fail.
+- Live desktop session already hot-reloaded the compiled `computer` tool schema; interactive approval and full model-driven task remain a manual acceptance step.
