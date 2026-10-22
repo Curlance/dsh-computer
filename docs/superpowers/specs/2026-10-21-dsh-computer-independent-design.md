@@ -147,7 +147,7 @@ src/
   "action": "act",
   "op": "click" | "doubleClick" | "rightClick" | "move" | "type" | "key" | "scroll" | "drag" | "wait" | "launch" | "focus" | "resize" | "kill",
   "target": { "element": 12 } | { "x": 640, "y": 360 },
-  "text": "hello", "keys": "ctrl+c", "direction": "down", "amount": 3,
+  "text": "hello", "keys": ["ctrl", "c"], "direction": "down", "amount": 3,
   "frame": { "x": 100, "y": 100, "width": 800, "height": 600 }, // resize
   "from": {"x":..,"y":..}, "to": {"x":..,"y":..},
   "delivery": "auto" | "background" | "foreground",

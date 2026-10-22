@@ -4,12 +4,15 @@
  *   1. migrate the legacy `dsh-computer-use` install into a rollback point;
  *   2. copy this package to `<dsh-home>/plugins/dsh-computer/<version>/`;
  *   3. point `<dsh-home>/profiles/<profile>/node_modules/dsh-computer` at it;
- *   4. write the managed root plugin row into `<dsh-home>/cordis.patch.yml`.
+ *   4. install `skills/computer-use` into `<dsh-home>/skills/computer-use`
+ *      (backing up an existing copy under `<dsh-home>/computer/backup/`);
+ *   5. write the managed root plugin row into `<dsh-home>/cordis.patch.yml`.
  *
- * `<dsh-home>` is `<home>/.dsh`, `$DSH_HOME` or `~/.dsh`. Every path can be
- * redirected (--home/--profile/--patch) so tests never touch the real `~/.dsh`;
- * --dry-run prints the plan without writing anything. --rollback restores the
- * patch and legacy package recorded by the last migration.
+ * With --home, `<dsh-home>` is `<home>/.dsh`; without it, `$DSH_HOME` is the
+ * DSH root itself (or `~/.dsh`). `$DSH_HOME` is ignored when --home is given.
+ * Every path can be redirected (--home/--profile/--patch) so tests never touch
+ * the real `~/.dsh`; --dry-run prints the plan without writing anything.
+ * --rollback restores the patch and legacy package recorded by the last migration.
  */
 
 import { cp, lstat, mkdir, readFile, readlink, rename, symlink, unlink, writeFile } from 'node:fs/promises'
@@ -25,6 +28,8 @@ import { ensurePluginRow } from '../lib/install/patch.js'
 const PACKAGE_NAME = 'dsh-computer'
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const PACKAGE_ENTRIES = ['package.json', 'index.js', 'lib', 'README.md']
+const SKILL_NAME = 'computer-use'
+const SKILL_SOURCE = join(PACKAGE_ROOT, 'skills', SKILL_NAME)
 const PATCH_CONFIG = {
   ...structuredClone(DEFAULT_CONFIG),
   audit: { ...DEFAULT_CONFIG.audit, path: '~/.dsh/computer/audit.jsonl' },
@@ -33,8 +38,10 @@ const PATCH_CONFIG = {
 const USAGE = `Usage: node scripts/install.mjs [options]
 
 Options:
-  --home <path>     User home directory; DSH files live in <home>/.dsh
-                    (default: $DSH_HOME, or ~/.dsh when DSH_HOME is unset)
+  --home <path>     User home directory; the DSH root becomes <path>/.dsh.
+                    Without --home, $DSH_HOME is used directly as the DSH root
+                    (default: ~/.dsh when DSH_HOME is unset). DSH_HOME is
+                    ignored when --home is given; do not combine them.
   --profile <name>  DSH profile name (default: desktop)
   --patch <path>    Patch file to edit (default: <dsh-home>/cordis.patch.yml)
   --rollback        Restore the patch and legacy package recorded by the last
@@ -84,10 +91,21 @@ async function main() {
   })
   const patchChanged = nextPatch !== (previousPatch ?? '')
 
+  const skillSource = await lstatIfExists(SKILL_SOURCE)
+  const skillExisting = await lstatIfExists(layout.skillDir)
+
   if (dryRun) {
     for (const action of plan.actions) actions.push(`[dry-run] migrate: ${describeAction(action)}`)
     actions.push(`[dry-run] copy ${PACKAGE_NAME}@${manifest.version} -> ${layout.versionDir}`)
     actions.push(`[dry-run] link ${layout.linkPath} -> ${layout.versionDir}`)
+    if (skillSource === null) {
+      actions.push(`[dry-run] skill skipped: ${SKILL_SOURCE} not found`)
+    } else {
+      if (skillExisting) {
+        actions.push(`[dry-run] backup skill -> ${await availableSkillBackupPath(layout)}`)
+      }
+      actions.push(`[dry-run] skill ${SKILL_SOURCE} -> ${layout.skillDir}`)
+    }
     actions.push(
       patchChanged
         ? `[dry-run] patch ${layout.patchPath}${backupHint(plan, layout)}`
@@ -102,6 +120,8 @@ async function main() {
 
   const linkChanged = await ensurePackageLink(layout.linkPath, layout.versionDir)
   actions.push(`${linkChanged ? 'link' : 'link unchanged'}: ${layout.linkPath} -> ${layout.versionDir}`)
+
+  actions.push(...(await installSkill(layout)))
 
   if (plan.actions.length > 0) {
     for (const action of plan.actions) actions.push(`migrate: ${describeAction(action)}`)
@@ -187,6 +207,8 @@ function resolveLayout(values, version) {
     profileNodeModules,
     versionDir: join(pluginsDir, PACKAGE_NAME, version),
     linkPath: join(profileNodeModules, PACKAGE_NAME),
+    skillsDir: join(dshHome, 'skills'),
+    skillDir: join(dshHome, 'skills', SKILL_NAME),
     patchPath: resolve(values.patch ?? join(dshHome, 'cordis.patch.yml')),
     backupDir: join(dshHome, 'computer', 'backup'),
     migrationBackupDir: join(pluginsDir, '_backup'),
@@ -216,6 +238,35 @@ async function ensurePackageLink(linkPath, targetDir) {
   await mkdir(dirname(linkPath), { recursive: true })
   await symlink(targetDir, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
   return true
+}
+
+async function installSkill(layout) {
+  if ((await lstatIfExists(SKILL_SOURCE)) === null) {
+    return [`skill skipped: ${SKILL_SOURCE} not found`]
+  }
+
+  const actions = []
+  if (await lstatIfExists(layout.skillDir)) {
+    const backupPath = await availableSkillBackupPath(layout)
+    await mkdir(layout.backupDir, { recursive: true })
+    await rename(layout.skillDir, backupPath)
+    actions.push(`backup: skill -> ${backupPath}`)
+  }
+
+  await mkdir(layout.skillsDir, { recursive: true })
+  await cp(SKILL_SOURCE, layout.skillDir, { recursive: true, force: true })
+  actions.push(`skill: ${layout.skillDir}`)
+  return actions
+}
+
+async function skillBackupPath(layout) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  return join(layout.backupDir, `skills-${stamp}`)
+}
+
+async function availableSkillBackupPath(layout) {
+  const candidate = await skillBackupPath(layout)
+  return (await lstatIfExists(candidate)) === null ? candidate : `${candidate}-${process.pid}`
 }
 
 async function backupAndWritePatch(patchPath, nextText, previousText, backupDir) {

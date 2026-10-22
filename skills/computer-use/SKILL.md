@@ -86,7 +86,7 @@ revision=7 window="记事本" space=1456x912
 | `click` / `doubleClick` / `rightClick` | `{element:id}` 或 `{x,y}`；可带 `delivery` |
 | `move` | `{element:id}` 或 `{x,y}` |
 | `type` | `{element:id}`（推荐）或已观察的前台窗口；`text` 必填 |
-| `key` | `keys:"ctrl+c"` 或 `keys:["ctrl","shift","t"]` |
+| `key` | `keys:["ctrl","c"]`（组合键必须是数组，如 `["ctrl","shift","t"]`） |
 | `scroll` | `direction:"up|down|left|right"`，`amount`（默认 3），可带 `target.element` |
 | `drag` | `from:{x,y}` + `to:{x,y}` |
 | `wait` | `amount` 毫秒（默认 1000） |
@@ -137,9 +137,10 @@ revision=7 window="记事本" space=1456x912
 
 ## 安全边界
 
-- **高风险审批**：`launch`/`kill`、坐标点击、前台输入、密码框/敏感词输入等会请求用户审批。
+- **高风险审批**：`launch`/`kill`、坐标点击、前台输入、敏感词输入等会请求用户审批。
   `approvals.mode` 为 `ask`（默认）或 `strict`；没有“高风险全自动”模式。
-- **硬阻断（无法绕过）**：密码框、UAC/安全桌面、没有当前观察的盲动作。被阻断就停止，不要尝试绕过。
+- **硬阻断（无法绕过）**：密码框（直接阻断，不走审批）、UAC/安全桌面、没有当前观察的盲动作。
+  被阻断就停止，不要尝试绕过。
 - **用户优先**：用户开始操作时让路；不要同时在多个会话/实例里操作桌面。
 - 发送、支付、删除、提交、覆盖等操作必须有用户明确授权；不绕过登录、UAC 或权限隔离，
   不擅自关闭用户程序。

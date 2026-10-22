@@ -25,20 +25,27 @@ Windows 桌面。纯 ESM JavaScript + JSDoc，零构建、零运行时依赖。
 git clone https://github.com/Curlance/dsh-computer.git
 cd dsh-computer
 node scripts/install.mjs --dry-run   # 先看计划，不写文件
-node scripts/install.mjs             # 复制版本目录、写 profile 链接、写托管插件行
+node scripts/install.mjs             # 复制版本、写 profile 链接/skill、写托管插件行
 ```
 
-安装器做四件事：
+安装器做五件事：
 
 1. 检测并迁移旧的 `dsh-computer-use`（旧预设/旧根行删除，旧包移到
    `~/.dsh/plugins/_backup/`，可用 `node scripts/install.mjs --rollback` 恢复）；
 2. 把包复制到 `~/.dsh/plugins/dsh-computer/<version>/`；
 3. 把 `~/.dsh/profiles/desktop/node_modules/dsh-computer` 指向该版本（junction）；
-4. 在 `~/.dsh/cordis.patch.yml` 写入一段带标记的根插件行。
+4. 把 `skills/computer-use` 复制到 `~/.dsh/skills/computer-use`；已有同名目录先移到
+   `~/.dsh/computer/backup/skills-<stamp>`；
+5. 在 `~/.dsh/cordis.patch.yml` 写入一段带标记的根插件行。
 
-参数：`--home <path>`（DSH home 的父目录，默认 `$DSH_HOME` 或 `~`）、
-`--profile <name>`（默认 `desktop`）、`--patch <path>`（默认 `<dsh-home>/cordis.patch.yml`）、
-`--dry-run`、`--rollback`。**安装后完全退出并重启 DSH**，新会话即可看到 `computer` 工具。
+参数：`--home <path>`（**用户主目录**，DSH 根为 `<path>/.dsh`）；不传 `--home` 时把
+`$DSH_HOME` 直接当作 DSH 根（未设置时用 `~/.dsh`）。`--home` 与 `$DSH_HOME` 同时设置时
+`$DSH_HOME` 会被忽略，不要混用。另有 `--profile <name>`（默认 `desktop`）、
+`--patch <path>`（默认 `<dsh-home>/cordis.patch.yml`）、`--dry-run`、`--rollback`。
+**安装后完全退出并重启 DSH**，新会话即可看到 `computer` 工具和 `computer-use` skill。
+
+`package.json#files` 包含 `scripts/`、`docs/`、`skills/`，所以从 tarball 解包后也能运行安装器
+并安装 skill；`tests/` 与 `.github/` 不在 tarball 里。
 
 ## 自检（doctor）
 
@@ -138,8 +145,8 @@ revision=7 window="记事本" space=1456x912
 | `cursor.enabled` | `true` | 显示独立 AI 光标；关掉则完全不启动光标会话 |
 | `cursor.theme` / `idleHideMs` / `glideMs` | `cua.default` / `0` / `600` | Cua 主题与轨迹参数 |
 | `approvals.mode` | `ask` | `ask`：高风险审批；`strict`：中/高风险审批；`relaxed` 当前等同 `ask` |
-| `policy.allowedApps` / `blockedApps` | `[]` | **已校验但尚未被 policy 消费**（见限制） |
-| `policy.maxActionsPerMinute` | `60` | **已校验但尚未限流** |
+| `policy.allowedApps` / `blockedApps` | `[]` | 按窗口标题（不区分大小写）子串匹配；blocked 优先，非空 allowed 只放行列出的标题 |
+| `policy.maxActionsPerMinute` | `60` | 每进程 60 s 滑动窗口；`observe`/`session`/`wait` 不计，重启清零 |
 | `audit.path` | `~/.dsh/computer/audit.jsonl` | JSONL 审计；`~` 会展开 |
 | `audit.includeScreenshots` | `false` | 仅为配置兼容；截图从不写审计 |
 | `backend.timeoutMs` | `15000` | 单次 cua-driver MCP 调用超时 |
@@ -151,14 +158,15 @@ revision=7 window="记事本" space=1456x912
 
 ## 安全
 
-- **审批**：高风险动作（`launch`/`kill`、坐标点击、前台输入、密码框/敏感词输入）默认请求用户审批；
+- **审批**：高风险动作（`launch`/`kill`、坐标点击、前台输入、敏感词输入）默认请求用户审批；
   拒绝后不会执行。
-- **硬阻断（不可配置绕过）**：密码框、UAC/安全桌面、没有当前观察的盲动作。
+- **硬阻断（不可配置绕过）**：密码框（直接阻断，不走审批）、UAC/安全桌面、没有当前观察的盲动作。
+- **应用门禁/限流**：`policy.allowedApps` / `blockedApps` 按窗口标题子串拦截；`maxActionsPerMinute` 限制动作频率。
 - **控制门禁**：用户 3 秒内有键鼠输入时拒绝动作并返回 `waitSeconds`；自身输入有 700 ms 启发式抵消。
 - **租约**：同一时间只有一个 agent 操作桌面（120 s TTL，自动续期）；其他会话得到 `busy`。
 - **审计**：默认 `~/.dsh/computer/audit.jsonl`；输入只记长度 + sha256 前缀，不记明文/截图。
-- **残余风险**：不是沙箱；硬阻断与空闲检测都是启发式；应用白/黑名单和限流尚未生效；
-  截图会进入模型上下文。完整说明见 [`docs/SAFETY.md`](docs/SAFETY.md)。
+- **残余风险**：不是沙箱；硬阻断与空闲检测都是启发式；应用白/黑名单只匹配窗口标题子串，
+  限流是进程内窗口（重启清零）；截图会进入模型上下文。完整说明见 [`docs/SAFETY.md`](docs/SAFETY.md)。
 
 ## 自动更新
 
@@ -166,8 +174,10 @@ revision=7 window="记事本" space=1456x912
 
 - tag `v*` 触发发布工作流：测试 → `npm pack` → 生成 `compat.json`（含 tarball sha256）→
   上传 tgz + `compat.json` → 创建 Release；
-- 更新器按 `engines.dsh` 选最高兼容版本，sha256 校验通过后才写插件目录，原子切换 profile 链接，
-  保留 previous 与 pending 标记（切换确认后清除 pending）以便 `--rollback`；
+- 更新器按 `compat.json` 里每个条目的 `dsh` 范围（发布时取自 `package.json#engines.dsh`）选最高兼容版本；
+  sha256 校验通过后才写插件目录，原子切换 profile 链接，保留 previous 供 `--rollback`；
+- `--apply` 先写 `pending.json`，在写完 `source:"updater"` 心跳后立即清除它；因为运行时还不写心跳，
+  pending 只用于发现“切换中途中断”，不是加载成功确认；
 - **不做签名**：sha256 只防损坏，信任边界是本仓库与 GitHub 账号。
 
 ```powershell
@@ -177,9 +187,9 @@ node scripts/update.mjs --manifest ".../compat.json" --apply
 node scripts/update.mjs --rollback
 ```
 
-**已知缺口**：计划任务（`node scripts/register-task.mjs`）目前只传 `--home`，没有
-`--manifest`/`--apply`，所以任务会以用法错误退出，自动更新尚未真正接通；请先手动执行上面的命令。
-插件运行时也还没有写健康心跳，更新后回滚是手动的。细节与故障处理见
+计划任务（`node scripts/register-task.mjs`，登录时 + 每 6 小时）会传
+`--apply --home <home> --manifest <compat URL>`，所以自动更新的命令已接通；但 DSH 运行时仍不写健康心跳，
+新版本加载失败不会被自动发现，更新后要人工检查并手动 `--rollback`。细节与故障处理见
 [`docs/AUTO-UPDATE.md`](docs/AUTO-UPDATE.md)。
 
 ## 卸载
@@ -189,7 +199,8 @@ node scripts/uninstall.mjs --dry-run
 node scripts/uninstall.mjs
 ```
 
-删除托管插件行、profile 链接和当前版本目录；保留 `~/.dsh/computer/**`（审计、备份等用户数据）。
+删除托管插件行、profile 链接、当前版本目录和 `~/.dsh/skills/computer-use`；如果安装时备份过同名
+skill，会恢复最近一个 `skills-*` 备份。保留 `~/.dsh/computer/**`（审计、备份等用户数据）。
 卸载后重启 DSH。要恢复被迁移的旧版：先卸载，再 `node scripts/install.mjs --rollback`。
 
 ## 开发与测试
@@ -216,8 +227,8 @@ CI 为 `.github/workflows/ci.yml`（windows-latest + Node 24 + `npm test`），�
 
 - 只支持 Windows 与主显示器；`target:{kind:"screen"}` 不支持多屏。
 - `focused_element` 等待条件在 cua-driver 0.36 上通常不命中（驱动不报告焦点元素）。
-- `policy.allowedApps` / `blockedApps` / `maxActionsPerMinute` 尚未生效；没有应用白/黑名单与限流。
-- AI 光标在启动时配置，动作路径还没有逐动作 glide。
+- `policy.allowedApps` / `blockedApps` 只按窗口标题子串匹配；限流是进程内 60 s 窗口，重启清零。
+- AI 光标 glide 覆盖 `click`/`move`/`drag`/元素 `scroll`；`type`/`key`/`wait`/`launch`/`focus`/`resize`/`kill` 不移动光标。
 - 观察的 `budgetMs` 只能事后标记超时，不能取消进行中的 UIA 遍历。
-- 计划任务自动更新未接通（缺 `--manifest`/`--apply`）；无运行时健康心跳；无签名。
-- npm tarball 只含 `index.js`、`lib/`、`README.md`；`scripts/`、`docs/`、`skills/` 需要仓库检出。
+- 无运行时健康心跳：更新后无法自动确认新版本加载成功，回滚需要手动执行；无签名。
+- npm tarball 含运行时、`scripts/`、`docs/` 和 `skills/`；`tests/`、`.github/` 不在包内。

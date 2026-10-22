@@ -17,7 +17,7 @@
 | `lib/tool.js` | 唯一 `computer` 工具：schema、`observe`/`act`/`session` 分发、租约与逐 step 授权 | `dispatch()`、`buildComputerTool()`、`toDshParameters()` |
 | `lib/observe.js` | 观察引擎：窗口选择、树/截图、revision + TTL 缓存、`waitFor` 轮询、坐标换算 | `createObserver()`、`toLocalPoint()`、`resolveTarget()`、`waitFor()` |
 | `lib/act.js` | 动作规划与执行：参数校验、动作摘要、effect 分类、执行后回读 | `execute()`、`executeBatch()`、`classifyEffect()`、`MissingTarget` |
-| `lib/policy.js` | 风险分级、不可绕过的硬阻断、审批请求 | `classifyRisk()`、`isHardBlocked()`、`createPolicy()` |
+| `lib/policy.js` | 风险分级、不可绕过的硬阻断、应用白/黑名单、动作限流、审批请求 | `classifyRisk()`、`isHardBlocked()`、`createPolicy()` |
 | `lib/control.js` | 用户活动门禁：空闲检测、自身动作 700 ms 抵消启发式 | `createControlGate()`、`createWindowsIdleProvider()` |
 | `lib/session.js` | 内存租约：单会话、TTL、续期、接管/恢复 | `createSessionManager()`、`SessionError` |
 | `lib/audit.js` | JSONL 审计；输入只记长度 + sha256 前缀 | `createAudit()`、`redactText()` |
@@ -33,11 +33,11 @@
 | `lib/update/compat.js` | 从 `compat.json` 选最高兼容版本（纯函数） | `selectVersion()` |
 | `lib/update/install.js` | 更新器的文件系统核心：校验、解包、原子切换、心跳、回滚 | `installVersion()`、`switchCurrent()`、`recordHeartbeat()`、`needsRollback()`、`rollback()`、`IntegrityError` |
 | `lib/update/notify.js` | 尽力而为的 Windows toast | `notify()` |
-| `scripts/install.mjs` | 安装：复制版本目录、profile junction、写托管插件行、迁移旧版 | CLI |
-| `scripts/uninstall.mjs` | 卸载：删插件行、链接、版本目录；保留用户数据 | CLI |
+| `scripts/install.mjs` | 安装：复制版本目录、profile junction、安装 `skills/computer-use`（旧目录备份）、写托管插件行、迁移旧版 | CLI |
+| `scripts/uninstall.mjs` | 卸载：删插件行、链接、版本目录、已安装 skill（恢复最近备份）；保留用户数据 | CLI |
 | `scripts/doctor.mjs` | 自检：DSH 版本/兼容、驱动、patch、安装链接（复用 `lib/compat.js#detectDshVersion`） | `doctor()`、`detectDshVersion`（re-export） |
 | `scripts/update.mjs` | 更新器 CLI：`--check` / `--apply` / `--rollback` | `runUpdate()` |
-| `scripts/register-task.mjs` / `unregister-task.mjs` | 计划任务 `dsh-computer-updater`（登录 + 每 6 小时） | `renderTaskCommand()`、`registerTask()` |
+| `scripts/register-task.mjs` / `unregister-task.mjs` | 计划任务 `dsh-computer-updater`（登录 + 每 6 小时；动作带 `--apply --manifest`） | `renderTaskCommand({home, scriptPath, intervalHours, manifestUrl, profile})`、`registerTask()` |
 | `scripts/smoke.mjs` / `smoke-action.mjs` | 真机冒烟（非单测） | CLI |
 
 依赖方向：`index.js` 是唯一 import 宿主包（`@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools`）的地方；
@@ -145,11 +145,13 @@ computer{action:"act", op|steps, target, revision?, ...}
   与内联 `required`，无法表达 `minimum/minLength/minItems` 等数值/长度约束。`lib/tool.js` 保留完整
   JSON Schema 作为参考，再经 `toDshParameters()` 投影成 DSL；宿主 schema 不会强制这些范围，
   真正的范围校验发生在 `act.js`/`observe.js`/`config.js` 的运行时检查里。
-- **运行中检测是心跳启发式**：`update.mjs` 把“10 分钟内由非 updater 写入的 heartbeat”当作 DSH 在运行。
-  当前插件运行时**尚未写 heartbeat**（只有 updater 在 `--apply` 时写 `source:"updater"` 的那条），
-  所以 `needsRollback()` 无法确认新版本真的被加载；更新后需要人工检查，不要把它当自动健康检查。
-- **cursor**：`ensureCursor()` 在启动时配置会话/主题；`glideTo()` 已实现并有单测，但动作路径尚未调用它，
-  所以光标是“可见且已配置”，不是每个动作都滑向目标。
+- **运行中检测是启发式**：Windows 上用 `tasklist` 查 `DeepSeek Harness.exe`，同时把“10 分钟内由
+  非 updater 写入的 heartbeat”当作 DSH 在运行。当前插件运行时**尚未写 heartbeat**（只有 updater
+  在 `--apply` 时写 `source:"updater"` 的那条），所以 `needsRollback()` 无法确认新版本真的被加载；
+  更新后需要人工检查，不要把它当自动健康检查。
+- **cursor**：`ensureCursor()` 在启动时配置会话/主题；`host.js` 把 `glideTo()` 注入动作路径，
+  `click`/`move`/`drag`/元素 `scroll` 在调用后端前滑向目标点。`type`/`key`/`wait`/`launch`/`focus`/
+  `resize`/`kill` 不移动光标；glide 失败只被吞掉，不影响动作结果。
 - **控制门禁**：空闲检测依赖 PowerShell + `GetLastInputInfo`（每次调用最多 3 s 超时、1 s 缓存）；
   自身输入用“最近 agent 动作后 700 ms 内不算用户”的启发式抵消，真实用户在这 700 ms 内的输入会被误判。
   `onUnknown:'block'` 在 `createControlGate()` 中可用，但插件配置尚未暴露该字段，默认 `allow`。
@@ -158,8 +160,12 @@ computer{action:"act", op|steps, target, revision?, ...}
 - **观察预算不能取消**：`budgetMs` 只在驱动返回后标记 `truncated`/`budget`，无法中断进行中的 UIA 遍历。
 - **回读是启发式**：`verifyAfter()` 比较回读树与观察树的 role/label/value/focused/frame/actions，
   只返回“是否有变化 + 变化数”，不是语义成功判定。
-- **配置里暂未生效的项**：`policy.allowedApps` / `policy.blockedApps` / `policy.maxActionsPerMinute`
-  已在校验与默认值中，但 policy 尚未消费它们；不要把它们当已生效的限流/白名单。
+- **应用门禁靠窗口标题**：`policy.allowedApps` / `blockedApps` 用动作携带的窗口标题做不区分大小写的
+  子串匹配；`blockedApps` 优先，非空 `allowedApps` 只放行列出的标题。进程名只记录在动作摘要里，
+  不参与匹配；标题相似或空标题的应用可能被误放/误拦。
+- **限流是进程内窗口**：`policy.maxActionsPerMinute` 只统计已通过审批的动作，60 s 滑动窗口、重启清零；
+  多实例不共享计数，`observe`/`session`/`wait` 不计。
 - **单进程租约**：租约是内存态；DSH 重启或多实例同时运行时，跨进程没有互斥（依赖单实例使用）。
-- **发布包内容**：`package.json.files` 只有 `index.js`、`lib/`、`README.md`；`scripts/`、`docs/`、
-  `skills/` 不进 npm tarball。安装/自检/更新需要仓库检出，更新器下发的 tarball 只提供运行时。
+- **发布包内容**：`package.json.files` 含 `index.js`、`lib/`、`scripts/`、`docs/`、`skills/` 和
+  `README.md`；`tests/`、`.github/` 不在 npm tarball。更新器下发的 tarball 因而也带安装/自检/
+  更新脚本与 skill。

@@ -371,6 +371,10 @@ unpacked**, containing only `README.md`, `index.js`, `lib/**` and
 `.github/` are intentionally not in the tarball, so installer/doctor/updater
 and the skill require a repository checkout.
 
+> Follow-up: `0d3d7f5` added `scripts/`, `docs/` and `skills/` to `files`;
+> the current tarball includes installer/doctor/updater and the skill. See the
+> Task 20 fix pass below.
+
 ### Workflow syntax
 
 ```powershell
@@ -391,3 +395,53 @@ true in code today: defineTool DSL cannot express numeric bounds; the runtime
 does not write a health heartbeat; the scheduled updater task does not pass
 `--manifest`/`--apply`; app allow/block lists and the per-minute action limit
 are validated but not enforced; only the primary display is supported.
+
+> Follow-up: `b3687ef` wired the scheduled task's `--apply`/`--manifest`, and
+> `0d3d7f5` enforced app gates/rate limits and wired cursor glide, so the last
+> three claims above are stale. The fix pass below re-checked the docs against
+> the code.
+
+## Task 20 fix pass — review findings (2026-10-22)
+
+Scope: docs/workflows/install-skill wiring only; `lib/`, `tests/` and
+`package.json` were not edited. Base: `0d3d7f5` (policy app gates, cursor glide
+wiring, package files) on top of `b3687ef` (updater rollback/scheduled apply).
+
+### Changes verified
+
+- `release.yml` derives the `compat.json` `dsh` value from
+  `package.json#engines.dsh` with `node -p` and throws when it is empty; the
+  same value is written to `compat.json` and the release notes.
+- `scripts/install.mjs` copies `skills/computer-use` to
+  `<dsh-home>/skills/computer-use`, backing up an existing copy under
+  `<dsh-home>/computer/backup/skills-<stamp>`; `scripts/uninstall.mjs` removes
+  the installed copy and restores the newest `skills-*` backup.
+- README/AUTO-UPDATE/ARCHITECTURE/SAFETY/CHANGELOG/skill now match the code:
+  manifest-entry `dsh` selection, immediate pending clear after the updater
+  heartbeat, `--home` vs `DSH_HOME`, password fields as hard blocks, array
+  `keys`, version-only safety pin, current `renderTaskCommand` signature,
+  `--dry-run` scope, and the current package contents / enforced app gates,
+  rate limit and glide wiring.
+
+### Commands and results
+
+```powershell
+node --check scripts/install.mjs
+node --check scripts/uninstall.mjs
+python -c "import yaml; [yaml.safe_load(open(p, encoding='utf-8')) for p in ['.github/workflows/ci.yml', '.github/workflows/release.yml']]"
+node --test tests/install-e2e.test.mjs
+node --test tests/*.test.mjs
+npm pack --dry-run --json
+```
+
+- both `node --check` runs passed; both workflows parse as YAML.
+- install e2e: **18/18 pass**.
+- full suite: **407 tests, 406 pass, 1 skipped, 0 fail** (~5.0 s).
+- `npm pack --dry-run`: **38 files**; the tarball now includes `README.md`,
+  `index.js`, `lib/**`, `scripts/**`, `docs/**` and `skills/computer-use/SKILL.md`
+  (`tests/` and `.github/` are excluded).
+- Scratch-home manual check: an existing custom skill was moved to
+  `computer/backup/skills-<stamp>` on install; uninstall removed the installed
+  copy and restored the custom `SKILL.md`.
+- Relative-link check over README, CHANGELOG, `docs/**` and `skills/**`: no
+  broken links. `git show --check`: no whitespace errors.

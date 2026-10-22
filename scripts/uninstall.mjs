@@ -3,14 +3,17 @@
  * Uninstall dsh-computer:
  *   1. remove the managed root plugin row from `<dsh-home>/cordis.patch.yml`;
  *   2. unlink `<dsh-home>/profiles/<profile>/node_modules/dsh-computer`;
- *   3. delete `<dsh-home>/plugins/dsh-computer/<version>/`.
+ *   3. delete `<dsh-home>/plugins/dsh-computer/<version>/`;
+ *   4. remove the installed `<dsh-home>/skills/computer-use`, restoring the most
+ *      recent `skills-*` backup from `<dsh-home>/computer/backup/` if present.
  *
- * `<dsh-home>` is `<home>/.dsh`, `$DSH_HOME` or `~/.dsh`. User data
- * (`<dsh-home>/computer/**`, including audit logs and backups) is kept.
- * Every path can be redirected (--home/--profile/--patch); --dry-run only prints.
+ * With --home, `<dsh-home>` is `<home>/.dsh`; without it, `$DSH_HOME` is the
+ * DSH root itself (or `~/.dsh`). `$DSH_HOME` is ignored when --home is given.
+ * User data (`<dsh-home>/computer/**`, including audit logs and backups) is
+ * kept. Every path can be redirected (--home/--profile/--patch); --dry-run only prints.
  */
 
-import { lstat, mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,13 +22,16 @@ import { parseArgs } from 'node:util'
 import { removePluginRow } from '../lib/install/patch.js'
 
 const PACKAGE_NAME = 'dsh-computer'
+const SKILL_NAME = 'computer-use'
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 const USAGE = `Usage: node scripts/uninstall.mjs [options]
 
 Options:
-  --home <path>     User home directory; DSH files live in <home>/.dsh
-                    (default: $DSH_HOME, or ~/.dsh when DSH_HOME is unset)
+  --home <path>     User home directory; the DSH root becomes <path>/.dsh.
+                    Without --home, $DSH_HOME is used directly as the DSH root
+                    (default: ~/.dsh when DSH_HOME is unset). DSH_HOME is
+                    ignored when --home is given; do not combine them.
   --profile <name>  DSH profile name (default: desktop)
   --patch <path>    Patch file to edit (default: <dsh-home>/cordis.patch.yml)
   --dry-run         Print planned actions without writing anything
@@ -52,6 +58,8 @@ async function main() {
   const previousPatch = await readTextIfExists(layout.patchPath)
   const nextPatch = previousPatch === null ? null : removePluginRow(previousPatch, PACKAGE_NAME)
   const patchChanged = previousPatch !== nextPatch
+  const skillStats = await lstatIfExists(layout.skillDir)
+  const skillBackup = await latestSkillBackup(layout)
 
   if (dryRun) {
     actions.push(
@@ -65,6 +73,12 @@ async function main() {
         : `[dry-run] link absent: ${layout.linkPath}`,
     )
     actions.push(`[dry-run] remove ${layout.versionDir}`)
+    actions.push(
+      skillStats
+        ? `[dry-run] remove ${layout.skillDir}`
+        : `[dry-run] skill absent: ${layout.skillDir}`,
+    )
+    if (skillBackup) actions.push(`[dry-run] restore skill <- ${skillBackup}`)
     print(actions)
     return
   }
@@ -91,6 +105,8 @@ async function main() {
 
   await rm(layout.versionDir, { recursive: true, force: true })
   actions.push(`remove: ${layout.versionDir}`)
+
+  await uninstallSkill(layout, actions)
 
   print(actions)
 }
@@ -135,9 +151,43 @@ function resolveLayout(values, version) {
   return {
     versionDir: join(dshHome, 'plugins', PACKAGE_NAME, version),
     linkPath: join(dshHome, 'profiles', values.profile, 'node_modules', PACKAGE_NAME),
+    skillsDir: join(dshHome, 'skills'),
+    skillDir: join(dshHome, 'skills', SKILL_NAME),
     patchPath: resolve(values.patch ?? join(dshHome, 'cordis.patch.yml')),
     backupDir: join(dshHome, 'computer', 'backup'),
   }
+}
+
+async function uninstallSkill(layout, actions) {
+  if (await lstatIfExists(layout.skillDir)) {
+    await rm(layout.skillDir, { recursive: true, force: true })
+    actions.push(`remove: ${layout.skillDir}`)
+  } else {
+    actions.push(`skill absent: ${layout.skillDir}`)
+  }
+
+  const backupPath = await latestSkillBackup(layout)
+  if (!backupPath) return
+  await mkdir(layout.skillsDir, { recursive: true })
+  await rename(backupPath, layout.skillDir)
+  actions.push(`restore: skill <- ${backupPath}`)
+}
+
+async function latestSkillBackup(layout) {
+  let names
+  try {
+    names = await readdir(layout.backupDir)
+  } catch (error) {
+    if (error.code === 'ENOENT') return null
+    throw error
+  }
+
+  for (const name of names.filter((entry) => entry.startsWith('skills-')).sort().reverse()) {
+    const candidate = join(layout.backupDir, name)
+    const stats = await lstatIfExists(candidate)
+    if (stats?.isDirectory()) return candidate
+  }
+  return null
 }
 
 async function backupAndWritePatch(patchPath, nextText, previousText, backupDir) {

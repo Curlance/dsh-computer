@@ -3,9 +3,9 @@
 `dsh-computer` 的更新器独立于 DSH 运行：DSH 升级后旧版本可能因 `engines.dsh` 不满足而无法加载，
 所以不能只靠插件自己更新。当前实现由仓库脚本 + Windows 计划任务 + GitHub Releases 组成。
 
-> 结论先说：**发布/校验/原子切换/回滚的代码已实现并有单测；但“计划任务自动跑起来”这一步还没接通**。
-> 计划任务注册的命令不带 `--manifest` / `--apply`，当前会以用法错误退出；自动更新需要手动执行
-> `scripts/update.mjs`。详见第 6 节。
+> 结论先说：发布/校验/原子切换/回滚与计划任务注册的代码都已实现并有单测。计划任务会以
+> `--apply --manifest <compat URL>` 运行；但运行时仍不写健康心跳，更新后无法自动确认新版本加载成功，
+> 回滚是手动的。详见第 5、6 节。
 
 ## 1. 信任根
 
@@ -46,8 +46,8 @@
 如果要同时支持多个 DSH 版本，需要维护一个累积的 `compat.json`（把所有仍受支持的版本条目放进去），
 而不是只指向最新 Release 的单条目文件。当前工作流不合并历史条目。
 
-`package.json.files` 只包含 `index.js`、`lib/`、`README.md`，所以 tarball 是可运行的最小包；
-安装/自检/计划任务脚本只在仓库检出里，不随更新下发。
+`package.json.files` 包含 `index.js`、`lib/`、`scripts/`、`docs/`、`skills/` 和 `README.md`，
+所以 tarball 自带安装/自检/更新脚本与 skill；`tests/`、`.github/` 不随包发布。
 
 ## 3. 版本选择
 
@@ -58,6 +58,9 @@
   `dsh` 范围不匹配当前 DSH；
 - 在合法条目里按 semver 取**最高**版本；
 - 没有候选 → `null`。
+
+`selectVersion()` 只读 `compat.json` 每个条目自己的 `dsh` 范围，不读安装包的 `engines.dsh`；发布工作流
+从 `package.json#engines.dsh` 生成这个字段（缺字段会再次失败，不会静默写成空范围）。
 
 `package.json` 的 `engines.dsh` 与 `lib/compat.js#DSH_REQUIREMENT` 保持一致
 （`>=0.2.1-rc.2 <0.3.0`）。DSH 版本探测（`lib/compat.js#detectDshVersion`，`doctor` 复用同一实现）：
@@ -103,7 +106,8 @@ node scripts/update.mjs --manifest ... --check --json
 
 ## 5. 运行中检测（心跳启发式）
 
-`update.mjs` 默认把满足以下条件的 `heartbeat.json` 视为“DSH 正在运行”：
+`update.mjs` 在 Windows 上先用 `tasklist` 查 `DeepSeek Harness.exe`；此外把满足以下条件的
+`heartbeat.json` 也视为“DSH 正在运行”：
 
 - 文件位于 `<dsh-home>/computer/update/heartbeat.json`；
 - 最近 10 分钟内写入；
@@ -117,7 +121,7 @@ node scripts/update.mjs --manifest ... --check --json
 
 - `needsRollback()` 只能发现“切换过程中崩溃/中断”，无法发现“新版本加载失败”；
 - 更新后没有一个由 DSH 运行时确认的健康信号，回滚是**手动**的（`--rollback`）；
-- 计划任务也无法靠运行时心跳判断 DSH 是否在运行。
+- 计划任务无法靠运行时心跳判断 DSH 是否在运行（Windows 上退化为 `tasklist` 进程检测）。
 
 设计中的“插件 apply 成功后写心跳、下次计划任务据此回滚”尚未实现。
 
@@ -132,13 +136,15 @@ node scripts/unregister-task.mjs           # 删除任务
 任务以当前用户身份运行，命令形如：
 
 ```
-"<node.exe>" "<repo>\scripts\update.mjs" --home "<home>"
+"<node.exe>" "<repo>\scripts\update.mjs" --apply --home "<home>" --manifest "<compat URL>" [--profile "<name>"]
 ```
 
-**已知缺口**：`update.mjs` 要求 `--check` / `--apply` / `--rollback` 三选一，且 `--check`/`--apply`
-必须带 `--manifest`；注册器当前只传 `--home`。所以任务会以用法错误退出，不会自动更新。
-在脚本补齐参数之前，请手动执行第 4 节的命令，或自行注册一个带 `--manifest ... --apply` 的任务。
-`lib/update/notify.js` 的 toast 也还没有被更新器调用，失败/回滚目前只体现在退出码与输出。
+`--manifest` 默认是
+`https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json`，可用
+`--manifest-url` 覆盖；`--home` 是用户主目录（updater 用 `<home>/.dsh`）。每次触发时，如果 DSH
+正在运行（Windows `tasklist` 或心跳判断），`--apply` 会拒绝切换并退出 1，等下一次（默认 6 小时后）
+再试——所以自动更新只在 DSH 完全退出时生效。`lib/update/notify.js` 的 toast 还没有被更新器调用，
+失败/回滚目前只体现在退出码与输出。
 
 计划任务与 DSH 同用户权限，不提升权限；卸载/删除任务不会删除已安装的插件或用户数据。
 
@@ -159,7 +165,7 @@ node scripts/unregister-task.mjs           # 删除任务
 
 ## 8. 发布检查清单（本地）
 
-1. `npm test` 通过（当前 384 个测试，0 失败，见 [verification.md](verification.md)）；
+1. `npm test` 通过（结果见 [verification.md](verification.md)）；
 2. `package.json.version` 与准备打的 tag 一致；
 3. `node scripts/doctor.mjs` 在真机安装上通过；
 4. 打 tag `v<version>` 并推送（**Task 20 不推送、不发布**；由维护者执行）；

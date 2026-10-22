@@ -22,19 +22,22 @@ Initial release (A+B: plugin core + desktop `computer` tool). Windows only.
   ambiguous backend outcomes are never reported as success.
 - **Safety**: risk classification (low/medium/high), approval modes
   `ask`/`strict`/`relaxed`, non-overridable blocks for password fields,
-  UAC/secure desktop and unobserved actions, and a user-activity control gate
-  backed by `GetLastInputInfo` with a self-action heuristic.
+  UAC/secure desktop and unobserved actions, a user-activity control gate
+  backed by `GetLastInputInfo` with a self-action heuristic, window-title
+  app allow/block gates and a per-process action rate limit.
 - **Session lease**: one agent at a time, 120 s TTL with renewal, explicit
   `takeover` / `resume`, `busy` instead of queueing.
 - **Audit**: append-only JSONL with session/agent/action/risk/decision/effect
   and hashed input summaries; plaintext input and screenshots are not stored.
 - **Visible AI cursor**: Cua Driver agent-cursor session and theme, best-effort
-  configuration, glide helper and cursor status.
+  configuration, glide wired into pointer actions and cursor status.
 - **Cua Driver 0.36 backend** over persistent `cua-driver mcp` stdio, with
   timeout, transport-only retry and lazy start on first tool call.
 - **Installer / uninstaller / doctor**: managed `cordis.patch.yml` root-plugin
-  row, profile junction, migration from `dsh-computer-use`, install checks,
-  `--dry-run` everywhere.
+  row, profile junction, `computer-use` skill install (existing copy backed up
+  under `computer/backup/`, restored on uninstall), migration from
+  `dsh-computer-use`, install checks; `--dry-run` for install/uninstall/
+  register-task (doctor and update do not take it).
 - **Auto-update foundation**: `compat.json` selection by DSH range, sha256
   verification before writes, atomic version switch, previous/pending markers,
   heartbeat-based running detection, manual rollback, scheduled-task
@@ -49,9 +52,8 @@ Initial release (A+B: plugin core + desktop `computer` tool). Windows only.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 [docs/SAFETY.md](docs/SAFETY.md) and
-[docs/AUTO-UPDATE.md](docs/AUTO-UPDATE.md). The main ones: the scheduled updater
-task does not yet pass `--manifest`/`--apply`; the runtime does not write the
-health heartbeat; no code signing; app allow/block lists and action rate limits
-are configured but not enforced; no native global input hook; only the primary
-display is supported; `scripts/`, `docs/` and `skills/` are not in the npm
-tarball.
+[docs/AUTO-UPDATE.md](docs/AUTO-UPDATE.md). The main ones: the runtime does not
+write the health heartbeat, so a failed update load needs a manual rollback;
+no code signing; app gates match window titles only and the rate limit is a
+per-process 60 s window; cursor glide covers pointer actions only; no native
+global input hook; only the primary display is supported.

@@ -2,7 +2,8 @@
 
 `dsh-computer` 让模型通过 Cua Driver 操作**真实 Windows 桌面**。它不是沙箱，也不提升权限：
 插件、计划任务、`cua-driver` 都以当前用户身份运行，能做的操作就是这个用户能做的操作。
-本文描述当前实现（`0.1.0`，HEAD `9a8e9de`）真正的安全行为，以及仍然存在的限制。
+本文描述 `0.1.0` 版本真正的安全行为，以及仍然存在的限制。它绑定版本而不是某个 commit：
+行为随版本变化，排查具体构建时请以对应 tag 的代码与 [CHANGELOG](../CHANGELOG.md) 为准。
 
 ## 1. 决策顺序
 
@@ -13,7 +14,9 @@
   → policy.authorize
       1. 硬阻断（不可配置绕过）
       2. 风险分级
-      3. 审批（按模式）
+      3. 应用白/黑名单（窗口标题子串）
+      4. 每分钟限流（进程内窗口）
+      5. 审批（按模式）
   → control.assertAgentAllowed（用户是否正在用桌面）
   → 租约校验/续期（同一时间一个 agent）
   → 后端执行
@@ -99,8 +102,8 @@
   真正的全局输入监听需要原生模块，A+B 不包含。
 - **硬阻断是启发式**：UIA 不可见/本地化异常的密码框、自定义安全界面可能漏判；
   不要依赖它替代 Windows 自身的 UAC/登录边界。
-- **配置项未生效**：`policy.allowedApps`、`policy.blockedApps`、`policy.maxActionsPerMinute`
-  目前只做校验/默认值，policy 不消费它们——**没有应用白/黑名单，也没有动作限流**。
+- **应用门禁/限流有边界**：`policy.allowedApps` / `blockedApps` 只按窗口标题子串匹配，不匹配
+  进程名；`maxActionsPerMinute` 是进程内 60 s 窗口、重启清零。它们用于收窄误操作，不是安全边界。
 - **子 agent 无独立限制**：根插件行对所有会话可见；租约只保证串行，不区分主/子 agent 的权限。
 - **截图会进入模型上下文**：`includeScreenshot` 默认随 `mode`（`tree` 时为 false），
   但视觉模型调用会得到图片附件；敏感桌面请用 `mode:"tree"`。
