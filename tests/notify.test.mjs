@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 import { notify } from '../lib/update/notify.js'
 import {
+  DEFAULT_MANIFEST_URL,
   TASK_NAME,
   main as registerMain,
   registerTask,
@@ -57,8 +58,12 @@ test('renderTaskCommand registers a logon task that repeats every 6 hours', () =
   assert.equal(task.name, TASK_NAME)
   assert.equal(task.name, 'dsh-computer-updater')
   assert.equal(
+    DEFAULT_MANIFEST_URL,
+    'https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json',
+  )
+  assert.equal(
     task.command,
-    `"${resolve(process.execPath)}" "${scriptPath}" --home "${homePath}"`,
+    `"${resolve(process.execPath)}" "${scriptPath}" --apply --home "${homePath}" --manifest "${DEFAULT_MANIFEST_URL}"`,
   )
 
   // One wrapper registers both triggers: schtasks /RI is not valid with ONLOGON,
@@ -73,7 +78,9 @@ test('renderTaskCommand registers a logon task that repeats every 6 hours', () =
   // build them at runtime and contain none of its own.
   assert.ok(wrapper.includes('$q = [char]34'))
   assert.ok(
-    wrapper.includes("$argument = $q + $script + $q + ' --home ' + $q + $homePath + $q"),
+    wrapper.includes(
+      "$argument = $q + $script + $q + ' --apply --home ' + $q + $homePath + $q + ' --manifest ' + $q + $manifest + $q",
+    ),
     'action argument is assembled with the runtime quote character',
   )
   assert.ok(!wrapper.includes('"'), 'wrapper carries no literal double quotes')
@@ -81,8 +88,35 @@ test('renderTaskCommand registers a logon task that repeats every 6 hours', () =
   // Single source of truth: the wrapper's literals reconstruct exactly the
   // action command that renderTaskCommand exposes and tests assert on.
   assert.equal(
-    `"${psLiteral(wrapper, 'node')}" "${psLiteral(wrapper, 'script')}" --home "${psLiteral(wrapper, 'homePath')}"`,
+    `"${psLiteral(wrapper, 'node')}" "${psLiteral(wrapper, 'script')}" --apply --home "${psLiteral(wrapper, 'homePath')}" --manifest "${psLiteral(wrapper, 'manifest')}"`,
     task.command,
+  )
+})
+
+test('renderTaskCommand appends the profile only when one is given', () => {
+  const withProfile = renderTaskCommand({ home: HOME, scriptPath: SCRIPT, profile: 'beta' })
+  assert.ok(withProfile.command.endsWith(' --profile "beta"'))
+  assert.equal(
+    withProfile.command,
+    `"${resolve(process.execPath)}" "${resolve(SCRIPT)}" --apply --home "${resolve(HOME)}" --manifest "${DEFAULT_MANIFEST_URL}" --profile "beta"`,
+  )
+  const wrapper = decodeWrapper(withProfile.schedule[0])
+  assert.ok(
+    wrapper.includes("+ ' --profile ' + $q + $profile + $q"),
+    'profile is appended with the runtime quote character',
+  )
+
+  const withoutProfile = renderTaskCommand({ home: HOME, scriptPath: SCRIPT })
+  assert.ok(!withoutProfile.command.includes('--profile'))
+  assert.ok(!decodeWrapper(withoutProfile.schedule[0]).includes('$profile'))
+
+  assert.throws(
+    () => renderTaskCommand({ home: HOME, scriptPath: SCRIPT, profile: '../desktop' }),
+    /profile/,
+  )
+  assert.throws(
+    () => renderTaskCommand({ home: HOME, scriptPath: SCRIPT, manifestUrl: 'not a url' }),
+    /manifestUrl/,
   )
 })
 
@@ -93,11 +127,12 @@ test('renderTaskCommand keeps spaced paths quoted in the encoded action', () => 
   const wrapper = decodeWrapper(task.schedule[0])
 
   assert.equal(
-    `"${psLiteral(wrapper, 'script')}" --home "${psLiteral(wrapper, 'homePath')}"`,
-    `"${resolve(spacedScript)}" --home "${resolve(spacedHome)}"`,
+    `"${psLiteral(wrapper, 'script')}" --apply --home "${psLiteral(wrapper, 'homePath')}" --manifest "${psLiteral(wrapper, 'manifest')}"`,
+    `"${resolve(spacedScript)}" --apply --home "${resolve(spacedHome)}" --manifest "${DEFAULT_MANIFEST_URL}"`,
   )
   assert.ok(task.command.includes(`"${resolve(spacedScript)}"`))
   assert.ok(task.command.includes(`"${resolve(spacedHome)}"`))
+  assert.ok(task.command.includes(`"${DEFAULT_MANIFEST_URL}"`))
 })
 
 test('renderTaskCommand honors a custom interval and resolves relative paths', () => {
@@ -129,13 +164,20 @@ test('registerTask runs the logon registration command with a bounded timeout', 
   const result = await registerTask({
     home: HOME,
     scriptPath: SCRIPT,
+    manifestUrl: 'https://example.test/compat.json',
+    profile: 'beta',
     exec: async (...args) => {
       calls.push(args)
     },
     log: (line) => logs.push(line),
   })
 
-  const task = renderTaskCommand({ home: HOME, scriptPath: SCRIPT })
+  const task = renderTaskCommand({
+    home: HOME,
+    scriptPath: SCRIPT,
+    manifestUrl: 'https://example.test/compat.json',
+    profile: 'beta',
+  })
   assert.equal(calls.length, 1)
   assert.equal(calls[0][0], task.schedule[0])
   assert.ok(Number.isFinite(calls[0][1].timeout))
@@ -198,13 +240,41 @@ test('register CLI reports an actionable error and returns exit code 1', async (
 test('register CLI --dry-run prints the command without touching the real scheduler', async () => {
   const { stdout } = await run(
     process.execPath,
-    [REGISTER, '--home', HOME, '--script', SCRIPT, '--dry-run'],
+    [
+      REGISTER,
+      '--home',
+      HOME,
+      '--script',
+      SCRIPT,
+      '--manifest-url',
+      'https://example.test/compat.json',
+      '--profile',
+      'beta',
+      '--dry-run',
+    ],
     { cwd: REPO_ROOT },
   )
 
   const wrapper = decodeWrapper(stdout.trim())
   assert.match(wrapper, /New-ScheduledTaskTrigger -AtLogOn/)
   assert.ok(wrapper.includes(resolve(SCRIPT)))
+  assert.ok(wrapper.includes('https://example.test/compat.json'))
+  assert.ok(wrapper.includes('$profile'))
+})
+
+test('register CLI defaults to an apply run against the release manifest', async () => {
+  const logs = []
+  const code = await registerMain({
+    argv: ['--home', HOME, '--script', SCRIPT, '--dry-run'],
+    exec: noExec(),
+    log: (line) => logs.push(line),
+  })
+
+  assert.equal(code, 0)
+  const wrapper = decodeWrapper(logs.join('\n'))
+  assert.ok(wrapper.includes(DEFAULT_MANIFEST_URL))
+  assert.ok(wrapper.includes("' --apply --home '"))
+  assert.ok(!wrapper.includes('$profile'))
 })
 
 test('register CLI exits 1 for invalid arguments', async () => {
@@ -257,7 +327,7 @@ test('encoded wrapper composes a quoted action argument in real PowerShell', asy
 
   assert.equal(
     stdout.trim(),
-    `${resolve(process.execPath)}|"${resolve(spacedScript)}" --home "${resolve(spacedHome)}"`,
+    `${resolve(process.execPath)}|"${resolve(spacedScript)}" --apply --home "${resolve(spacedHome)}" --manifest "${DEFAULT_MANIFEST_URL}"`,
     'spaced paths keep their quotes in the registered action argument',
   )
 })

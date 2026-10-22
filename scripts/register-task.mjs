@@ -3,8 +3,11 @@
  * Register the cross-version updater as a Windows scheduled task.
  *
  * The task `dsh-computer-updater` fires at logon and repeats every 6 hours while
- * the user is signed in. `--dry-run` prints the registration command and never
- * touches the real scheduler; tests inject `exec`.
+ * the user is signed in. The action runs `update.mjs --apply --home <home>
+ * --manifest <manifestUrl>` (plus `--profile <name>` when given), because a bare
+ * updater invocation exits for a missing mode. `--dry-run` prints the
+ * registration command and never touches the real scheduler; tests inject
+ * `exec`.
  */
 
 import { exec as nodeExec } from 'node:child_process'
@@ -14,18 +17,24 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs, promisify } from 'node:util'
 
 export const TASK_NAME = 'dsh-computer-updater'
+export const DEFAULT_MANIFEST_URL =
+  'https://github.com/Curlance/dsh-computer/releases/latest/download/compat.json'
 
 const defaultExec = promisify(nodeExec)
 const DEFAULT_SCRIPT = fileURLToPath(new URL('./update.mjs', import.meta.url))
 const RUN_TIMEOUT_MS = 15_000
+const PROFILE_RE = /^[A-Za-z0-9._-]+$/
 
 const USAGE = `Usage: node scripts/register-task.mjs [options]
 
 Options:
-  --home <path>     User home directory passed to the updater (default: ~)
-  --script <path>   Updater script to run (default: scripts/update.mjs)
-  --dry-run         Print the registration command without registering anything
-  -h, --help        Show this help
+  --home <path>          User home directory passed to the updater (default: ~)
+  --script <path>        Updater script to run (default: scripts/update.mjs)
+  --manifest-url <url>   Release manifest passed to \`--apply\`
+                         (default: ${DEFAULT_MANIFEST_URL})
+  --profile <name>       DSH profile passed to \`--apply\` (default: updater's)
+  --dry-run              Print the registration command without registering anything
+  -h, --help             Show this help
 `
 
 /**
@@ -41,10 +50,17 @@ Options:
  * `command` is derived from the same resolved paths, so the tested action string
  * and the registered action cannot drift apart.
  *
- * @param {{home: string, scriptPath: string, intervalHours?: number}} options
+ * @param {{home: string, scriptPath: string, intervalHours?: number,
+ *          manifestUrl?: string, profile?: string}} options
  * @returns {{name: string, command: string, schedule: string[]}}
  */
-export function renderTaskCommand({ home, scriptPath, intervalHours = 6 } = {}) {
+export function renderTaskCommand({
+  home,
+  scriptPath,
+  intervalHours = 6,
+  manifestUrl = DEFAULT_MANIFEST_URL,
+  profile,
+} = {}) {
   if (typeof home !== 'string' || home.length === 0) {
     throw new TypeError('home must be a non-empty path')
   }
@@ -54,19 +70,32 @@ export function renderTaskCommand({ home, scriptPath, intervalHours = 6 } = {}) 
   if (!Number.isFinite(intervalHours) || intervalHours <= 0) {
     throw new TypeError('intervalHours must be a positive number')
   }
+  if (!isHttpUrl(manifestUrl)) {
+    throw new TypeError('manifestUrl must be an http(s) URL')
+  }
+  if (profile !== undefined && !isProfileName(profile)) {
+    throw new TypeError('profile must be a simple profile name')
+  }
 
   const nodePath = resolve(process.execPath)
   const scriptPathAbs = resolve(scriptPath)
   const homePathAbs = resolve(home)
   // The action argument is parsed by CreateProcess, so paths need double quotes.
-  const command = `"${nodePath}" "${scriptPathAbs}" --home "${homePathAbs}"`
+  // `--apply` is mandatory: a bare `update.mjs` exits because it requires a mode.
+  let command = `"${nodePath}" "${scriptPathAbs}" --apply --home "${homePathAbs}" --manifest "${manifestUrl}"`
+  if (profile !== undefined) command += ` --profile "${profile}"`
+
   // `$home` is PowerShell's read-only automatic variable, hence `$homePath`.
   const wrapper = [
     '$q = [char]34',
     `$node = ${psQuote(nodePath)}`,
     `$script = ${psQuote(scriptPathAbs)}`,
     `$homePath = ${psQuote(homePathAbs)}`,
-    `$argument = $q + $script + $q + ' --home ' + $q + $homePath + $q`,
+    `$manifest = ${psQuote(manifestUrl)}`,
+    ...(profile === undefined ? [] : [`$profile = ${psQuote(profile)}`]),
+    `$argument = $q + $script + $q + ' --apply --home ' + $q + $homePath + $q + ' --manifest ' + $q + $manifest + $q${
+      profile === undefined ? '' : " + ' --profile ' + $q + $profile + $q"
+    }`,
     '$action = New-ScheduledTaskAction -Execute $node -Argument $argument',
     '$logon = New-ScheduledTaskTrigger -AtLogOn',
     `$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours ${intervalHours})`,
@@ -87,6 +116,8 @@ export function renderTaskCommand({ home, scriptPath, intervalHours = 6 } = {}) 
  *   home: string,
  *   scriptPath: string,
  *   intervalHours?: number,
+ *   manifestUrl?: string,
+ *   profile?: string,
  *   dryRun?: boolean,
  *   exec?: (command: string, options: object) => Promise<unknown>,
  *   log?: (line: string) => void,
@@ -96,11 +127,13 @@ export async function registerTask({
   home,
   scriptPath,
   intervalHours = 6,
+  manifestUrl = DEFAULT_MANIFEST_URL,
+  profile,
   dryRun = false,
   exec = defaultExec,
   log = console.log,
 } = {}) {
-  const task = renderTaskCommand({ home, scriptPath, intervalHours })
+  const task = renderTaskCommand({ home, scriptPath, intervalHours, manifestUrl, profile })
   if (dryRun) {
     log(task.schedule[0])
     return { ...task, dryRun: true }
@@ -145,6 +178,8 @@ export async function main({
     await registerTask({
       home: values.home ?? homedir(),
       scriptPath: values.script ?? DEFAULT_SCRIPT,
+      manifestUrl: values['manifest-url'] ?? DEFAULT_MANIFEST_URL,
+      profile: values.profile,
       dryRun: values['dry-run'] === true,
       exec,
       log,
@@ -167,12 +202,31 @@ function parseRegisterArgs(argv) {
     options: {
       home: { type: 'string' },
       script: { type: 'string' },
+      'manifest-url': { type: 'string' },
+      profile: { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
     strict: true,
   })
   return values
+}
+
+function isProfileName(profile) {
+  return (
+    typeof profile === 'string' && PROFILE_RE.test(profile) && profile !== '.' && profile !== '..'
+  )
+}
+
+function isHttpUrl(value) {
+  if (typeof value !== 'string' || value.trim() === '') return false
+  let url
+  try {
+    url = new URL(value)
+  } catch {
+    return false
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:'
 }
 
 function psQuote(value) {

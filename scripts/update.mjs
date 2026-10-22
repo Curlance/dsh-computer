@@ -10,13 +10,14 @@
  * DSH_VERSION -> DSH_APP_PACKAGE_JSON -> `<dshHome>/version` and known app
  * package paths -> `dsh --version` (through the cmd.exe shim on win32).
  *
- * Running-DSH detection: DSH has no portable single-instance lock, so until the
- * runtime writes its own heartbeat this is heartbeat-based: a heartbeat younger
- * than 10 minutes from a non-updater source counts as "DSH is running" and the
- * switch is refused. Only a heartbeat with `source: 'runtime'` confirms a
- * pending switch; a pending switch with any other, missing, malformed or stale
- * heartbeat is rollback-required, so `--apply` refuses instead of overwriting
- * `previous.json`. `isDshRunning` is injectable for tests.
+ * Running-DSH detection: on Windows a `tasklist` lookup for the DSH process
+ * ("DeepSeek Harness.exe") refuses the switch while DSH runs. A heartbeat
+ * younger than 10 minutes from a non-updater source also counts as "DSH is
+ * running" (the runtime heartbeat is not wired yet). Only a heartbeat with
+ * `source: 'runtime'` confirms a pending switch; a pending switch with any
+ * other, missing, malformed or stale heartbeat is rollback-required, so
+ * `--apply` refuses instead of overwriting `previous.json`. `isDshRunning` is
+ * injectable for tests.
  *
  * Every path can be redirected with `--home`, `--profile` and `--patch`, so
  * nothing touches the real `~/.dsh`. `--check` prints the selected release;
@@ -45,6 +46,7 @@ import {
 const execFileAsync = promisify(execFile)
 
 const PACKAGE_NAME = 'dsh-computer'
+const DSH_PROCESS_NAME = 'DeepSeek Harness.exe'
 const DEFAULT_STALE_MS = 600000
 
 const USAGE = `Usage: node scripts/update.mjs [options]
@@ -52,9 +54,11 @@ const USAGE = `Usage: node scripts/update.mjs [options]
 Options:
   --home <path>      User home directory; DSH files live in <home>/.dsh
                      (default: $DSH_HOME, or ~/.dsh when DSH_HOME is unset)
-  --profile <name>   DSH profile name (default: desktop)
+  --profile <name>   DSH profile name (default: desktop; --rollback reuses
+                     the profile recorded by the last --apply)
   --patch <path>     Patch file to back up and restore
-                     (default: <dsh-home>/cordis.patch.yml)
+                     (default: <dsh-home>/cordis.patch.yml; --rollback reuses
+                     the path recorded by the last --apply)
   --manifest <src>   Release manifest: a local file path or an http(s) URL
                      (required for --check and --apply)
   --check            Report the installed and selected versions without writing
@@ -90,14 +94,19 @@ export async function runUpdate(options = {}) {
   if (values.help) return { action: 'help', usage: USAGE }
 
   const layout = resolveLayout(values, env)
+  const platform = options.platform ?? process.platform
+  const execFile = options.execFile ?? defaultExecFile
 
   if (values.rollback) {
-    const result = await rollback({
+    const rollbackOptions = {
       pluginsDir: layout.pluginsDir,
-      profileNodeModules: layout.profileNodeModules,
       stateDir: layout.stateDir,
-      patchPath: layout.patchPath,
-    })
+    }
+    // Only pass --profile/--patch when the user gave them; otherwise rollback
+    // restores what the switch recorded (never the default paths).
+    if (layout.profileExplicit) rollbackOptions.profileNodeModules = layout.profileNodeModules
+    if (layout.patchPathExplicit) rollbackOptions.patchPath = layout.patchPath
+    const result = await rollback(rollbackOptions)
     return { action: 'rollback', restored: result.restored, patch: result.patch }
   }
 
@@ -106,8 +115,8 @@ export async function runUpdate(options = {}) {
     dshHome: layout.dshHome,
     env,
     readFile,
-    execFile: options.execFile ?? defaultExecFile,
-    platform: options.platform ?? process.platform,
+    execFile,
+    platform,
   })
 
   if (values.check) {
@@ -119,6 +128,7 @@ export async function runUpdate(options = {}) {
       dshVersion,
       available,
       changed: available !== null && available.version !== current,
+      rollbackRequired: await needsRollback({ stateDir: layout.stateDir, now }),
     }
   }
 
@@ -135,7 +145,7 @@ export async function runUpdate(options = {}) {
 
   const running = options.isDshRunning
     ? await options.isDshRunning({ stateDir: layout.stateDir, now })
-    : await defaultIsDshRunning({ stateDir: layout.stateDir, now })
+    : await defaultIsDshRunning({ stateDir: layout.stateDir, now, execFile, platform })
   if (running) {
     throw new Error('DSH is running; exit DSH completely and retry the update')
   }
@@ -161,6 +171,7 @@ export async function runUpdate(options = {}) {
     stateDir: layout.stateDir,
     patchBackupPath,
     patchPath: layout.patchPath,
+    profile: layout.profile,
     now,
   })
   await recordHeartbeat({
@@ -188,7 +199,7 @@ function parseCli(argv) {
       args: argv,
       options: {
         home: { type: 'string' },
-        profile: { type: 'string', default: 'desktop' },
+        profile: { type: 'string' },
         patch: { type: 'string' },
         manifest: { type: 'string' },
         check: { type: 'boolean', default: false },
@@ -204,7 +215,12 @@ function parseCli(argv) {
   }
 
   if (values.help) return values
-  if (!/^[A-Za-z0-9._-]+$/.test(values.profile) || values.profile === '.' || values.profile === '..') {
+  if (
+    values.profile !== undefined &&
+    (!/^[A-Za-z0-9._-]+$/.test(values.profile) ||
+      values.profile === '.' ||
+      values.profile === '..')
+  ) {
     throw new Error(`Invalid profile name: ${values.profile}\n\n${USAGE}`)
   }
   const modes = [values.check, values.apply, values.rollback].filter(Boolean).length
@@ -220,15 +236,19 @@ function resolveLayout(values, env) {
   const envHome = env.DSH_HOME || join(homedir(), '.dsh')
   const dshHome = home === null ? resolve(envHome) : join(home, '.dsh')
   const stateDir = join(dshHome, 'computer', 'update')
-  const profileDir = join(dshHome, 'profiles', values.profile)
+  const profile = values.profile ?? 'desktop'
+  const profileDir = join(dshHome, 'profiles', profile)
   return {
     dshHome,
     pluginsDir: join(dshHome, 'plugins'),
+    profile,
+    profileExplicit: values.profile !== undefined,
     profileDir,
     profileNodeModules: join(profileDir, 'node_modules'),
     stateDir,
     cacheDir: join(stateDir, 'cache'),
     patchPath: values.patch === undefined ? join(dshHome, 'cordis.patch.yml') : resolve(values.patch),
+    patchPathExplicit: values.patch !== undefined,
   }
 }
 
@@ -302,7 +322,18 @@ async function backupPatch(layout, now) {
   return backupPath
 }
 
-async function defaultIsDshRunning({ stateDir, now, staleMs = DEFAULT_STALE_MS }) {
+async function defaultIsDshRunning({
+  stateDir,
+  now,
+  staleMs = DEFAULT_STALE_MS,
+  execFile = defaultExecFile,
+  platform = process.platform,
+}) {
+  if (await heartbeatSaysRunning({ stateDir, now, staleMs })) return true
+  return processSaysRunning({ execFile, platform })
+}
+
+async function heartbeatSaysRunning({ stateDir, now, staleMs }) {
   let heartbeat
   try {
     heartbeat = JSON.parse(await readFile(join(stateDir, 'heartbeat.json'), 'utf8'))
@@ -316,6 +347,23 @@ async function defaultIsDshRunning({ stateDir, now, staleMs = DEFAULT_STALE_MS }
   const at = Date.parse(heartbeat.at)
   if (Number.isNaN(at)) return true
   return toDate(now).getTime() - at <= staleMs
+}
+
+async function processSaysRunning({ execFile, platform }) {
+  // Windows process check; other platforms rely on the heartbeat contract.
+  if (platform !== 'win32') return false
+  let stdout
+  try {
+    const result = await execFile('tasklist', ['/FI', `IMAGENAME eq ${DSH_PROCESS_NAME}`])
+    stdout = typeof result === 'string' ? result : (result?.stdout ?? '')
+  } catch {
+    // tasklist may be unavailable; the heartbeat check stays the fallback.
+    return false
+  }
+  const prefix = DSH_PROCESS_NAME.toLowerCase()
+  return String(stdout)
+    .split(/\r?\n/)
+    .some((line) => line.trim().toLowerCase().startsWith(prefix))
 }
 
 function toDate(now) {
@@ -346,7 +394,13 @@ export function printResult(result, json) {
     } else if (result.available === null) {
       console.log('available: none (no release supports this DSH)')
     } else {
-      console.log(`${result.changed ? 'available' : 'up to date'}: ${result.available.version}`)
+      // An unconfirmed switch is not "up to date" even when the link already
+      // points at the selected version.
+      const label = result.changed || result.rollbackRequired ? 'available' : 'up to date'
+      console.log(`${label}: ${result.available.version}`)
+    }
+    if (result.rollbackRequired) {
+      console.log('rollback: required (previous update is unconfirmed; run --rollback)')
     }
     return
   }

@@ -885,6 +885,160 @@ test('runUpdate --patch backs up and restores the configured patch file', async 
   assert.equal(await readFile(customPatch, 'utf8'), 'plugins:\n  custom: true\n')
 })
 
+test('runUpdate --rollback without --patch restores the patch path recorded at apply time', async (t) => {
+  const layout = await createLayout(t)
+  const customPatch = join(layout.root, 'custom', 'cordis.patch.yml')
+  await mkdir(dirname(customPatch), { recursive: true })
+  await writeFile(customPatch, 'plugins:\n  custom: true\n', 'utf8')
+  const targetBytes = Buffer.from('tarball-0.2.0')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([{ ...release('0.2.0'), sha256: sha256(targetBytes) }]))
+
+  const options = {
+    env: { DSH_VERSION },
+    fetchImpl: fetchBytes(targetBytes),
+    extractImpl: extractAs('0.2.0'),
+    isDshRunning: async () => false,
+  }
+  await runUpdate({
+    ...options,
+    argv: ['--home', layout.home, '--patch', customPatch, '--manifest', manifestPath, '--apply'],
+  })
+  assert.equal((await readJson(join(layout.stateDir, 'previous.json'))).patchPath, customPatch)
+  await writeFile(customPatch, 'plugins:\n  custom: false\n', 'utf8')
+
+  // No --patch on rollback: the recorded path must win over the default path.
+  const result = await runUpdate({
+    ...options,
+    argv: ['--home', layout.home, '--rollback'],
+  })
+
+  assert.equal(result.patch, customPatch)
+  assert.equal(await readFile(customPatch, 'utf8'), 'plugins:\n  custom: true\n')
+  assert.equal(await readFile(layout.patchPath, 'utf8'), 'plugins:\n  existing: true\n')
+})
+
+test('runUpdate --rollback without --profile restores the recorded profile only', async (t) => {
+  const layout = await createLayout(t, { profile: 'beta' })
+  // A second, untouched profile that must not be repointed by a beta rollback.
+  const desktopNodeModules = join(layout.dshHome, 'profiles', 'desktop', 'node_modules')
+  await mkdir(desktopNodeModules, { recursive: true })
+  const desktopDir = await installPackageDir(layout.pluginsDir, '0.0.9')
+  const desktopLink = join(desktopNodeModules, PACKAGE_NAME)
+  await symlink(
+    desktopDir,
+    desktopLink,
+    process.platform === 'win32' ? 'junction' : 'dir',
+  )
+
+  const targetBytes = Buffer.from('tarball-0.2.0')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([{ ...release('0.2.0'), sha256: sha256(targetBytes) }]))
+
+  const options = {
+    env: { DSH_VERSION },
+    fetchImpl: fetchBytes(targetBytes),
+    extractImpl: extractAs('0.2.0'),
+    isDshRunning: async () => false,
+  }
+  await runUpdate({
+    ...options,
+    argv: ['--home', layout.home, '--profile', 'beta', '--manifest', manifestPath, '--apply'],
+  })
+
+  const previous = await readJson(join(layout.stateDir, 'previous.json'))
+  assert.equal(previous.profile, 'beta')
+  assert.equal(previous.path, layout.versionDir)
+
+  const result = await runUpdate({
+    ...options,
+    argv: ['--home', layout.home, '--rollback'],
+  })
+
+  assert.equal(result.restored, '0.1.0')
+  assert.equal(await linkPointsTo(layout.linkPath, layout.versionDir), true)
+  // The default profile kept its own link instead of being repointed at beta's.
+  assert.equal(await linkPointsTo(desktopLink, desktopDir), true)
+})
+
+test('runUpdate --check surfaces a pending rollback instead of up to date', async (t) => {
+  const layout = await createLayout(t, { version: '0.2.0' })
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([release('0.2.0')]))
+  await mkdir(layout.stateDir, { recursive: true })
+  await writeJson(join(layout.stateDir, 'pending.json'), {
+    version: '0.2.0',
+    at: '2026-10-22T00:00:00.000Z',
+  })
+
+  const result = await runUpdate({
+    argv: ['--home', layout.home, '--manifest', manifestPath, '--check'],
+    env: { DSH_VERSION },
+    now: () => new Date('2026-10-22T00:10:00.000Z'),
+  })
+
+  assert.equal(result.changed, false)
+  assert.equal(result.rollbackRequired, true)
+  const { logs } = captureConsole(() => printResult(result, false))
+  assert.ok(logs.some((line) => line.includes('rollback: required')))
+  assert.ok(!logs.some((line) => line.includes('up to date')))
+})
+
+test('runUpdate --apply refuses when the DSH process is running on Windows', async (t) => {
+  const layout = await createLayout(t)
+  const targetBytes = Buffer.from('tarball-0.2.0')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([{ ...release('0.2.0'), sha256: sha256(targetBytes) }]))
+  let fetched = false
+  const calls = []
+
+  await assert.rejects(
+    runUpdate({
+      argv: ['--home', layout.home, '--manifest', manifestPath, '--apply'],
+      env: { DSH_VERSION },
+      platform: 'win32',
+      execFile: async (file, args) => {
+        calls.push([file, args])
+        return { stdout: 'DeepSeek Harness.exe   1234 Console   1   100,000 K\n' }
+      },
+      fetchImpl: async () => {
+        fetched = true
+        return bytesResponse(targetBytes)
+      },
+      extractImpl: extractAs('0.2.0'),
+    }),
+    /DSH is running/,
+  )
+
+  assert.deepEqual(calls, [['tasklist', ['/FI', 'IMAGENAME eq DeepSeek Harness.exe']]])
+  assert.equal(fetched, false)
+  assert.equal(await linkPointsTo(layout.linkPath, layout.versionDir), true)
+})
+
+test('runUpdate --apply proceeds when the Windows process check finds no DSH', async (t) => {
+  const layout = await createLayout(t)
+  const targetBytes = Buffer.from('tarball-0.2.0')
+  const manifestPath = join(layout.root, 'manifest.json')
+  await writeJson(manifestPath, manifest([{ ...release('0.2.0'), sha256: sha256(targetBytes) }]))
+  const calls = []
+
+  const result = await runUpdate({
+    argv: ['--home', layout.home, '--manifest', manifestPath, '--apply'],
+    env: { DSH_VERSION },
+    platform: 'win32',
+    execFile: async (file, args) => {
+      calls.push([file, args])
+      return { stdout: 'INFO: No tasks are running which match the specified criteria.\n' }
+    },
+    fetchImpl: fetchBytes(targetBytes),
+    extractImpl: extractAs('0.2.0'),
+  })
+
+  assert.deepEqual(calls, [['tasklist', ['/FI', 'IMAGENAME eq DeepSeek Harness.exe']]])
+  assert.equal(result.changed, true)
+  assert.equal(result.to, '0.2.0')
+})
+
 test('runUpdate --apply refuses to overwrite previous.json while a switch is unconfirmed', async (t) => {
   const layout = await createLayout(t)
   const targetBytes = Buffer.from('tarball-0.2.0')
@@ -922,6 +1076,7 @@ test('runUpdate --apply refuses to overwrite previous.json while a switch is unc
         return bytesResponse(targetBytes)
       },
       extractImpl: extractAs('0.2.0'),
+      isDshRunning: async () => false,
       now,
     }),
     /previous update is unconfirmed/,
