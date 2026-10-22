@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Real Windows action smoke test: launch a target we own, observe it, click its
- * text area, type a unique marker, read it back, and close the target by pid.
+ * text area, type a unique marker, read it back from the editor's `Edit.value`,
+ * and close the target by pid.
  *
  * Target: a generated .hta document hosting a <textarea>, launched through
  * mshta.exe. Notepad is deliberately not used on this Windows build: packaged
@@ -11,8 +12,15 @@
  *
  * The AI cursor session is unique to this run and ended in cleanup. Budgets:
  * observe < 1500ms, element click < 800ms, readback < 1500ms; exceeding one is a
- * `slow` warning, not a failure. Prints one JSON document; exits 1 only on a
- * failed check.
+ * `slow` warning, not a failure. Every stage is wrapped so a thrown error is
+ * recorded and fails the run; the top-level catch records a `fatal` check.
+ *
+ * Negative test (no desktop work): set SMOKE_FORCE_FAIL to a stage name, e.g.
+ *   SMOKE_FORCE_FAIL=backend-start node scripts/smoke-action.mjs
+ * The named stage throws before doing its work, so the run prints ok:false and
+ * exits 1.
+ *
+ * Prints one JSON document; exits 1 if any check failed.
  */
 import { existsSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -33,13 +41,29 @@ const CLICK_BUDGET_MS = 800
 const READBACK_BUDGET_MS = 1500
 const WAIT_AFTER_TYPE_MS = 300
 
+const STAGES = [
+  'driver',
+  'backend-start',
+  'target-setup',
+  'cursor-session',
+  'launch-target',
+  'observe',
+  'click-editor',
+  'type-marker',
+  'readback',
+  'cursor-position',
+]
+const FORCE_FAIL = process.env.SMOKE_FORCE_FAIL
+
 const checks = []
+const cleanupWarnings = []
 
 let backend
 let client
 let pid
 let session
 let tempDir
+let currentStage = 'main'
 
 function record(name, started, detail, { ok = true, slow = false } = {}) {
   const entry = { name, ok, ms: Math.round(performance.now() - started), detail }
@@ -49,6 +73,22 @@ function record(name, started, detail, { ok = true, slow = false } = {}) {
 
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function stage(name, fn) {
+  currentStage = name
+  const started = performance.now()
+  try {
+    if (FORCE_FAIL === name) {
+      throw new Error(`forced failure at stage "${name}" (negative test)`)
+    }
+    return await fn(started)
+  } catch (error) {
+    if (!checks.some((check) => check.name === name && !check.ok)) {
+      record(name, started, messageOf(error), { ok: false })
+    }
+    throw error
+  }
 }
 
 function targetDocument(title) {
@@ -71,6 +111,14 @@ function editorRow(tree) {
     tree.find((row) => /^(edit|document)$/i.test(row.role)) ??
     null
   )
+}
+
+function editValueOf(tree) {
+  return tree.find((row) => /^edit$/i.test(row.role))?.value
+}
+
+function includesMarker(value, marker) {
+  return typeof value === 'string' && value.includes(marker)
 }
 
 function editorPoint(row, observation) {
@@ -112,40 +160,55 @@ async function waitForWindow(pidValue, title, timeoutMs = 5000) {
   }
 }
 
+function observationDetail(observation, screenshot) {
+  const truncation = observation.truncationReason === undefined ? '' : `(${observation.truncationReason})`
+  return `title=${JSON.stringify(observation.title)}; tree=${observation.tree.length}; screenshot=${screenshot}B; truncated=${observation.truncated}${truncation}; budget=${OBSERVE_BUDGET_MS}ms`
+}
+
 async function main() {
-  const driverStart = performance.now()
-  const command = resolveDriverCommand()
-  if (!existsSync(command)) {
-    record('driver', driverStart, `cua-driver not found (${command}); install Cua Driver or set CUA_DRIVER_BIN`, {
-      ok: false,
-    })
-    throw new Error('cua-driver executable not found')
-  }
-  record('driver', driverStart, command)
+  const command = await stage('driver', (started) => {
+    const resolved = resolveDriverCommand()
+    if (!existsSync(resolved)) {
+      record('driver', started, `cua-driver not found (${resolved}); install Cua Driver or set CUA_DRIVER_BIN`, {
+        ok: false,
+      })
+      throw new Error('cua-driver executable not found')
+    }
+    record('driver', started, resolved)
+    return resolved
+  })
 
-  const transport = createProcessTransport({ command, args: ['mcp'] })
-  client = createMcpClient({ transport, timeoutMs: TIMEOUT_MS })
-  const backendStart = performance.now()
-  let serverInfo
-  try {
-    serverInfo = (await client.start()).serverInfo
-  } catch (error) {
-    record('backend-start', backendStart, messageOf(error), { ok: false })
-    throw error
-  }
-  record('backend-start', backendStart, `cua-driver ${serverInfo?.version ?? 'unknown'} ready`)
-  backend = createCuaBackend({ client })
+  await stage('backend-start', async (started) => {
+    const transport = createProcessTransport({ command, args: ['mcp'] })
+    client = createMcpClient({ transport, timeoutMs: TIMEOUT_MS })
+    const serverInfo = (await client.start()).serverInfo
+    backend = createCuaBackend({ client })
+    record('backend-start', started, `cua-driver ${serverInfo?.version ?? 'unknown'} ready`)
+  })
 
-  const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
-  const mshta = join(systemRoot, 'System32', 'mshta.exe')
-  if (!existsSync(mshta)) {
-    record('launch-target', performance.now(), `mshta.exe not found at ${mshta}`, { ok: false })
-    throw new Error('no isolated text target available')
-  }
+  const target = await stage('target-setup', async (started) => {
+    const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+    const mshta = join(systemRoot, 'System32', 'mshta.exe')
+    if (!existsSync(mshta)) {
+      record('target-setup', started, `mshta.exe not found at ${mshta}`, { ok: false })
+      throw new Error('no isolated text target available')
+    }
+    tempDir = await mkdtemp(join(tmpdir(), 'dsh-smoke-'))
+    const stamp = Date.now()
+    const title = `DSH-SMOKE-TARGET-${stamp}`
+    const marker = `DSH-MARKER-${stamp}`
+    const htaPath = join(tempDir, 'target.hta')
+    await writeFile(htaPath, targetDocument(title))
+    record('target-setup', started, `hta=${htaPath}`)
+    return { htaPath, marker, mshta, title }
+  })
 
   session = `dsh-smoke-${process.pid}-${Date.now()}`
   const cursorStart = performance.now()
   try {
+    if (FORCE_FAIL === 'cursor-session') {
+      throw new Error('forced failure at stage "cursor-session" (negative test)')
+    }
     await backend.startSession({ label: session })
     await backend.setAgentCursorEnabled(true)
     record('cursor-session', cursorStart, `session=${session}`)
@@ -153,147 +216,144 @@ async function main() {
     record('cursor-session', cursorStart, messageOf(error), { ok: false })
   }
 
-  tempDir = await mkdtemp(join(tmpdir(), 'dsh-smoke-'))
-  const stamp = Date.now()
-  const title = `DSH-SMOKE-TARGET-${stamp}`
-  const marker = `DSH-MARKER-${stamp}`
-  const htaPath = join(tempDir, 'target.hta')
-  await writeFile(htaPath, targetDocument(title))
+  const window = await stage('launch-target', async (started) => {
+    const launch = await backend.launchApp({
+      path: target.mshta,
+      additional_arguments: [target.htaPath],
+    })
+    pid = launch.structured?.pid
+    if (!Number.isInteger(pid)) {
+      record('launch-target', started, 'launch_app returned no pid', { ok: false })
+      throw new Error('launch_app returned no pid')
+    }
+    const match =
+      (launch.structured?.windows ?? []).find((entry) => entry.title?.includes(target.title)) ??
+      (await waitForWindow(pid, target.title))
+    if (match === null) {
+      record('launch-target', started, `pid=${pid}; no window appeared`, { ok: false })
+      throw new Error('launched target showed no window')
+    }
+    record(
+      'launch-target',
+      started,
+      `pid=${pid}; window=${match.window_id}; title=${JSON.stringify(match.title)}`,
+    )
+    return match
+  })
 
-  const launchStart = performance.now()
-  let launch
-  try {
-    launch = await backend.launchApp({ path: mshta, additional_arguments: [htaPath] })
-  } catch (error) {
-    record('launch-target', launchStart, messageOf(error), { ok: false })
-    throw error
-  }
-  pid = launch.structured?.pid
-  if (!Number.isInteger(pid)) {
-    record('launch-target', launchStart, 'launch_app returned no pid', { ok: false })
-    throw new Error('launch_app returned no pid')
-  }
-  const window =
-    (launch.structured?.windows ?? []).find((entry) => entry.title?.includes(title)) ??
-    (await waitForWindow(pid, title))
-  if (window === null) {
-    record('launch-target', launchStart, `pid=${pid}; no window appeared`, { ok: false })
-    throw new Error('launched target showed no window')
-  }
-  record('launch-target', launchStart, `pid=${pid}; window=${window.window_id}; title=${JSON.stringify(window.title)}`)
-
-  const observer = createObserver({ backend })
-  const observeStart = performance.now()
-  let observation
-  try {
-    observation = await observer.observe(
+  const observer = createObserver({ backend, budgetMs: OBSERVE_BUDGET_MS })
+  const observation = await stage('observe', async (started) => {
+    const observed = await observer.observe(
       { kind: 'window', pid, windowId: window.window_id },
       { mode: 'both' },
     )
-  } catch (error) {
-    record('observe', observeStart, messageOf(error), { ok: false })
-    throw error
-  }
-  const observeMs = performance.now() - observeStart
-  const screenshot = Buffer.isBuffer(observation.screenshotPng) ? observation.screenshotPng.length : 0
-  record(
-    'observe',
-    observeStart,
-    `title=${JSON.stringify(observation.title)}; tree=${observation.tree.length}; screenshot=${screenshot}B; budget=${OBSERVE_BUDGET_MS}ms`,
-    { ok: screenshot > 0, slow: observeMs >= OBSERVE_BUDGET_MS },
-  )
-
-  const clickStart = performance.now()
-  const click = await clickEditor(observation, editorRow(observation.tree))
-  const clickMs = performance.now() - clickStart
-  record('click-editor', clickStart, `${click.via}; effect=${click.result.effect}; budget=${CLICK_BUDGET_MS}ms`, {
-    ok: click.result.effect !== 'refused',
-    slow: clickMs >= CLICK_BUDGET_MS,
+    const screenshot = Buffer.isBuffer(observed.screenshotPng) ? observed.screenshotPng.length : 0
+    record('observe', started, observationDetail(observed, screenshot), {
+      ok: screenshot > 0,
+      slow: performance.now() - started >= OBSERVE_BUDGET_MS,
+    })
+    return observed
   })
 
-  // The click's readback replaces the driver snapshot, so observe again before
-  // typing instead of reusing the now-stale element tokens.
-  await sleep(100)
-  const typingObservation = await observer.observe(
-    { kind: 'window', pid, windowId: window.window_id },
-    { mode: 'tree' },
-  )
-  const typeStart = performance.now()
-  let typeResult = await execute(backend, { observation: typingObservation, op: 'type', text: marker })
-  if (typeResult.effect === 'refused') {
-    const row = editorRow(typingObservation.tree)
-    if (row !== null) {
-      typeResult = await execute(backend, {
-        observation: typingObservation,
-        op: 'type',
-        target: { element: row.id },
-        text: marker,
-      })
-    }
-  }
-  record('type-marker', typeStart, `effect=${typeResult.effect}; marker=${marker}`, {
-    ok: typeResult.effect !== 'refused',
+  await stage('click-editor', async (started) => {
+    const click = await clickEditor(observation, editorRow(observation.tree))
+    record(
+      'click-editor',
+      started,
+      `${click.via}; effect=${click.result.effect}; budget=${CLICK_BUDGET_MS}ms`,
+      { ok: click.result.effect !== 'refused', slow: performance.now() - started >= CLICK_BUDGET_MS },
+    )
   })
 
-  await sleep(WAIT_AFTER_TYPE_MS)
-  let readbackStart = performance.now()
-  let after = await observer.observe(
-    { kind: 'window', pid, windowId: window.window_id },
-    { mode: 'tree' },
-  )
-  let matched = after.tree.filter((row) => JSON.stringify(row).includes(marker))
-
-  if (matched.length === 0) {
-    // One pixel-click retry: some hosts need a real pointer focus before
-    // PostMessage WM_CHAR reaches the editor.
-    const row = editorRow(after.tree)
-    await execute(backend, { observation: after, op: 'click', target: editorPoint(row, after) })
+  await stage('type-marker', async () => {
+    // The click's readback replaces the driver snapshot, so observe again before
+    // typing instead of reusing the now-stale element tokens.
     await sleep(100)
-    await execute(backend, { observation: after, op: 'type', text: marker })
-    await sleep(WAIT_AFTER_TYPE_MS)
-    readbackStart = performance.now()
-    after = await observer.observe(
+    const typingObservation = await observer.observe(
       { kind: 'window', pid, windowId: window.window_id },
       { mode: 'tree' },
     )
-    matched = after.tree.filter((row) => JSON.stringify(row).includes(marker))
-  }
-
-  const readbackMs = performance.now() - readbackStart
-  const editValue = after.tree.find((row) => /^edit$/i.test(row.role))?.value
-  record(
-    'readback',
-    readbackStart,
-    `marker rows=${matched.length}; value=${JSON.stringify(typeof editValue === 'string' ? editValue.slice(0, 120) : editValue)}; budget=${READBACK_BUDGET_MS}ms`,
-    { ok: matched.length > 0, slow: readbackMs >= READBACK_BUDGET_MS },
-  )
-
-  const cursorStateStart = performance.now()
-  if (!checks.find((check) => check.name === 'cursor-session')?.ok) {
-    record('cursor-position', cursorStateStart, 'skipped: cursor session not started')
-  } else {
-    try {
-      const point = editorPoint(editorRow(after.tree), after)
-      await backend.moveCursor({
-        x: point.x,
-        y: point.y,
-        target: { kind: 'window', pid, window_id: window.window_id },
-      })
-      let state = await backend.getAgentCursorState()
-      let position = state.structured?.position ?? null
-      if (position === null) {
-        // The cursor glides by default; let the animation settle.
-        await sleep(800)
-        state = await backend.getAgentCursorState()
-        position = state.structured?.position ?? null
+    const typeStart = performance.now()
+    let typeResult = await execute(backend, {
+      observation: typingObservation,
+      op: 'type',
+      text: target.marker,
+    })
+    if (typeResult.effect === 'refused') {
+      const row = editorRow(typingObservation.tree)
+      if (row !== null) {
+        typeResult = await execute(backend, {
+          observation: typingObservation,
+          op: 'type',
+          target: { element: row.id },
+          text: target.marker,
+        })
       }
-      record('cursor-position', cursorStateStart, JSON.stringify(position), {
-        ok: Number.isFinite(position?.x) && Number.isFinite(position?.y),
-      })
-    } catch (error) {
-      record('cursor-position', cursorStateStart, messageOf(error), { ok: false })
     }
-  }
+    record('type-marker', typeStart, `effect=${typeResult.effect}; marker=${target.marker}`, {
+      ok: typeResult.effect !== 'refused',
+    })
+  })
+
+  await stage('readback', async () => {
+    await sleep(WAIT_AFTER_TYPE_MS)
+    let readbackStart = performance.now()
+    let after = await observer.observe(
+      { kind: 'window', pid, windowId: window.window_id },
+      { mode: 'tree' },
+    )
+    let editValue = editValueOf(after.tree)
+    let rowMatches = after.tree.filter((row) => JSON.stringify(row).includes(target.marker)).length
+
+    if (!includesMarker(editValue, target.marker)) {
+      // One pixel-click retry: some hosts need a real pointer focus before
+      // PostMessage WM_CHAR reaches the editor.
+      const row = editorRow(after.tree)
+      await execute(backend, { observation: after, op: 'click', target: editorPoint(row, after) })
+      await sleep(100)
+      await execute(backend, { observation: after, op: 'type', text: target.marker })
+      await sleep(WAIT_AFTER_TYPE_MS)
+      readbackStart = performance.now()
+      after = await observer.observe(
+        { kind: 'window', pid, windowId: window.window_id },
+        { mode: 'tree' },
+      )
+      editValue = editValueOf(after.tree)
+      rowMatches = after.tree.filter((row) => JSON.stringify(row).includes(target.marker)).length
+    }
+
+    const value = typeof editValue === 'string' ? editValue.slice(0, 120) : editValue
+    record(
+      'readback',
+      readbackStart,
+      `edit.value=${JSON.stringify(value)}; valueMatch=${includesMarker(editValue, target.marker)}; markerRows=${rowMatches}; budget=${READBACK_BUDGET_MS}ms`,
+      { ok: includesMarker(editValue, target.marker), slow: performance.now() - readbackStart >= READBACK_BUDGET_MS },
+    )
+  })
+
+  await stage('cursor-position', async (started) => {
+    if (!checks.find((check) => check.name === 'cursor-session')?.ok) {
+      record('cursor-position', started, 'skipped: cursor session not started')
+      return
+    }
+    const point = editorPoint(editorRow(observation.tree), observation)
+    await backend.moveCursor({
+      x: point.x,
+      y: point.y,
+      target: { kind: 'window', pid, window_id: window.window_id },
+    })
+    let state = await backend.getAgentCursorState()
+    let position = state.structured?.position ?? null
+    if (position === null) {
+      // The cursor glides by default; let the animation settle.
+      await sleep(800)
+      state = await backend.getAgentCursorState()
+      position = state.structured?.position ?? null
+    }
+    record('cursor-position', started, JSON.stringify(position), {
+      ok: Number.isFinite(position?.x) && Number.isFinite(position?.y),
+    })
+  })
 }
 
 async function cleanup() {
@@ -307,22 +367,56 @@ async function cleanup() {
     }
   }
   if (client !== undefined) {
-    if (session !== undefined) await client.call('end_session', { session }).catch(() => {})
-    await client.close().catch(() => {})
+    if (session !== undefined) {
+      try {
+        await client.call('end_session', { session })
+      } catch (error) {
+        cleanupWarnings.push(`end_session failed: ${messageOf(error)}`)
+      }
+    }
+    try {
+      await client.close()
+    } catch (error) {
+      cleanupWarnings.push(`client close failed: ${messageOf(error)}`)
+    }
   }
-  if (tempDir !== undefined) await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+  if (tempDir !== undefined) {
+    try {
+      await rm(tempDir, { recursive: true, force: true })
+    } catch (error) {
+      cleanupWarnings.push(`temp cleanup failed: ${messageOf(error)}`)
+    }
+  }
 }
 
-main()
-  .catch(() => {})
-  .finally(cleanup)
-  .finally(() => {
-    const warnings = checks
-      .filter((check) => check.slow)
-      .map((check) => `${check.name} took ${check.ms}ms (over budget)`)
-    const ok = checks.every((check) => check.ok)
-    console.log(
-      JSON.stringify({ ok, checks, ...(warnings.length > 0 ? { warnings } : {}) }, null, 2),
-    )
-    process.exitCode = ok ? 0 : 1
-  })
+async function run() {
+  try {
+    if (FORCE_FAIL !== undefined && !STAGES.includes(FORCE_FAIL)) {
+      throw new Error(
+        `unknown SMOKE_FORCE_FAIL stage "${FORCE_FAIL}"; expected one of: ${STAGES.join(', ')}`,
+      )
+    }
+    await main()
+  } catch (error) {
+    record('fatal', performance.now(), `${currentStage}: ${messageOf(error)}`, { ok: false })
+  } finally {
+    await cleanup()
+  }
+}
+
+function report() {
+  const warnings = checks
+    .filter((check) => check.slow)
+    .map((check) => `${check.name} took ${check.ms}ms (over budget)`)
+  warnings.push(...cleanupWarnings)
+  const ok = checks.every((check) => check.ok)
+  console.log(
+    JSON.stringify({ ok, checks, ...(warnings.length > 0 ? { warnings } : {}) }, null, 2),
+  )
+  process.exitCode = ok ? 0 : 1
+}
+
+run().then(report, (error) => {
+  record('fatal', performance.now(), messageOf(error), { ok: false })
+  report()
+})
