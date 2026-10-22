@@ -8,6 +8,7 @@ import {
   execute,
   executeBatch,
 } from '../lib/act.js'
+import { createPolicy } from '../lib/policy.js'
 
 const PID = 100
 const WINDOW_ID = 200
@@ -142,6 +143,13 @@ test('classifyEffect keeps missing evidence unverifiable and never promotes it',
   }
 })
 
+test('classifyEffect treats an ambiguous thrown error as unverifiable', () => {
+  const coded = Object.assign(new Error('delivery failed'), { code: 'background_unavailable' })
+  assert.equal(classifyEffect(coded), 'unverifiable')
+  assert.equal(classifyEffect(new Error('timeout waiting for the driver')), 'unverifiable')
+  assert.equal(classifyEffect(new Error('suspected_noop')), 'unverifiable')
+})
+
 test('classifyEffect keeps an ambiguous background failure unverifiable', () => {
   assert.equal(classifyEffect({ ok: false, code: 'background_unavailable' }), 'unverifiable')
   assert.equal(
@@ -188,6 +196,7 @@ test('click resolves an element frame center through observation space', async (
       element_token: 'save',
       count: 1,
       button: 'left',
+      delivery_mode: 'auto',
     },
   })
   assert.equal(result.verification.observed, true)
@@ -209,6 +218,7 @@ test('click accepts pixel targets and double/right click map count and button', 
     y: 360,
     count: 1,
     button: 'left',
+    delivery_mode: 'auto',
   })
 
   await execute(backend, {
@@ -360,10 +370,16 @@ test('key presses one key and routes key arrays through hotkey', async () => {
     keys: 'return',
   })
   assert.equal(single.effect, 'confirmed')
-  assert.deepEqual(backend.calls[0], { method: 'pressKey', args: { key: 'return' } })
+  assert.deepEqual(backend.calls[0], {
+    method: 'pressKey',
+    args: { key: 'return', delivery_mode: 'auto' },
+  })
 
   await execute(backend, { observation: OBSERVATION, op: 'key', keys: ['ctrl', 'c'] })
-  assert.deepEqual(backend.calls[1], { method: 'hotkey', args: { keys: ['ctrl', 'c'] } })
+  assert.deepEqual(backend.calls[1], {
+    method: 'hotkey',
+    args: { keys: ['ctrl', 'c'], delivery_mode: 'auto' },
+  })
 })
 
 test('key requires keys and a foreground target', async () => {
@@ -438,7 +454,15 @@ test('drag maps from/to points and requires both', async () => {
   assert.equal(result.effect, 'confirmed')
   assert.deepEqual(actionCalls(backend)[0], {
     method: 'drag',
-    args: { pid: PID, window_id: WINDOW_ID, from_x: 1, from_y: 2, to_x: 3, to_y: 4 },
+    args: {
+      pid: PID,
+      window_id: WINDOW_ID,
+      from_x: 1,
+      from_y: 2,
+      to_x: 3,
+      to_y: 4,
+      delivery_mode: 'auto',
+    },
   })
 
   await assert.rejects(
@@ -460,7 +484,12 @@ test('move resolves a pixel target without a readback', async () => {
   assert.deepEqual(backend.calls, [
     {
       method: 'moveCursor',
-      args: { x: 10, y: 20, target: { kind: 'window', pid: PID, window_id: WINDOW_ID } },
+      args: {
+        x: 10,
+        y: 20,
+        target: { kind: 'window', pid: PID, window_id: WINDOW_ID },
+        delivery_mode: 'auto',
+      },
     },
   ])
   assert.equal('verification' in result, false)
@@ -475,7 +504,44 @@ test('move resolves an element frame center', async () => {
     x: 160.77,
     y: 335.18,
     target: { kind: 'window', pid: PID, window_id: WINDOW_ID },
+    delivery_mode: 'auto',
   })
+})
+
+test('click, key, drag and move forward the delivery mode', async () => {
+  const backend = createFakeBackend()
+
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    delivery: 'background',
+    observeAfter: false,
+  })
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'key',
+    keys: 'return',
+    delivery: 'foreground',
+  })
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'drag',
+    from: { x: 1, y: 2 },
+    to: { x: 3, y: 4 },
+    delivery: 'background',
+  })
+  await execute(backend, {
+    observation: OBSERVATION,
+    op: 'move',
+    target: { x: 10, y: 20 },
+    delivery: 'foreground',
+  })
+
+  assert.deepEqual(
+    actionCalls(backend).map((call) => call.args.delivery_mode),
+    ['background', 'foreground', 'background', 'foreground'],
+  )
 })
 
 test('wait sleeps, reports noop, and never calls the backend', async () => {
@@ -635,6 +701,40 @@ test('an injected authorize function can deny any action', async () => {
   assert.equal(backend.calls.length, 0)
 })
 
+test('policy receives the caller target shape and keeps an element click low risk', async () => {
+  const backend = createFakeBackend()
+  const seen = []
+  let decision
+  const policy = createPolicy({
+    config: { approvals: { mode: 'ask' } },
+    approval: {
+      request: async () => {
+        throw new Error('approval must not be requested for a low-risk element click')
+      },
+    },
+  })
+
+  const result = await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    authorize: async (request) => {
+      seen.push(request)
+      decision = await policy.authorize(request)
+      return decision
+    },
+    observeAfter: false,
+  })
+
+  assert.equal(result.effect, 'confirmed')
+  assert.deepEqual(seen[0].target, { element: 'save' })
+  assert.equal(seen[0].action.target.element, 'save')
+  assert.equal(seen[0].observation, OBSERVATION)
+  assert.equal(decision.allowed, true)
+  assert.equal(decision.risk, 'low')
+  assert.deepEqual(actionCalls(backend).map((call) => call.method), ['click'])
+})
+
 // --- backend effects and readback -----------------------------------------
 
 test('a backend throw becomes a refused result, not a thrown action', async () => {
@@ -672,7 +772,43 @@ test('background_unavailable is unverifiable and suggests a foreground retry', a
 
   assert.equal(result.effect, 'unverifiable')
   assert.match(result.detail, /foreground/)
+  assert.match(result.advice, /foreground/)
   assert.doesNotMatch(result.detail, /confirmed/)
+})
+
+test('an ambiguous backend throw is unverifiable with foreground advice', async () => {
+  const backend = createFakeBackend({
+    results: {
+      click: () => {
+        throw Object.assign(new Error('delivery failed'), { code: 'background_unavailable' })
+      },
+    },
+  })
+
+  const result = await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    observeAfter: false,
+  })
+
+  assert.equal(result.effect, 'unverifiable')
+  assert.match(result.detail, /delivery failed/)
+  assert.match(result.advice, /foreground/)
+})
+
+test('every unverifiable result carries a next-step advice', async () => {
+  const backend = createFakeBackend({ results: { click: { ok: true } } })
+
+  const result = await execute(backend, {
+    observation: OBSERVATION,
+    op: 'click',
+    target: { element: 'save' },
+    observeAfter: false,
+  })
+
+  assert.equal(result.effect, 'unverifiable')
+  assert.match(result.advice, /screen_observe|重新/)
 })
 
 test('readback never upgrades unverifiable to confirmed', async () => {
@@ -726,6 +862,77 @@ test('a failed readback keeps the action effect and reports an unobserved verifi
   assert.equal(result.effect, 'confirmed')
   assert.equal(result.verification.observed, false)
   assert.match(result.verification.error, /window closed/)
+})
+
+test('readback normalizes raw backend rows before comparing', async () => {
+  const observation = {
+    ...OBSERVATION,
+    tree: [
+      {
+        id: 0,
+        role: 'Window',
+        label: 'Editor',
+        frame: { x: 0, y: 0, w: 2880, h: 1800 },
+        actions: [],
+        focused: true,
+      },
+      {
+        id: 1,
+        role: 'Button',
+        label: 'Save',
+        frame: { x: 282, y: 644, w: 72, h: 38 },
+        actions: ['invoke'],
+      },
+    ],
+  }
+  const backend = createFakeBackend({
+    state: {
+      structured: {
+        elements: [
+          {
+            element_index: 0,
+            role: 'Window',
+            name: 'Editor',
+            frame: { x: 0, y: 0, width: 2880, height: 1800 },
+            actions: [],
+            has_keyboard_focus: true,
+          },
+          {
+            element_index: 1,
+            role: 'Button',
+            name: 'Save',
+            frame: { x: 282, y: 644, width: 72, height: 38 },
+            actions: ['invoke'],
+          },
+        ],
+      },
+    },
+  })
+
+  const result = await execute(backend, {
+    observation,
+    op: 'click',
+    target: { element: 1 },
+  })
+
+  assert.equal(result.effect, 'confirmed')
+  assert.deepEqual(result.verification, { observed: true, changed: false, updated: 0 })
+})
+
+test('a pixel click works without observation.tree and skips readback', async () => {
+  const backend = createFakeBackend()
+  const observation = { ...OBSERVATION }
+  delete observation.tree
+
+  const result = await execute(backend, {
+    observation,
+    op: 'click',
+    target: { x: 640, y: 360 },
+  })
+
+  assert.equal(result.effect, 'confirmed')
+  assert.equal('verification' in result, false)
+  assert.deepEqual(actionCalls(backend).map((call) => call.method), ['click'])
 })
 
 test('an invalid op is a readable validation error', async () => {
@@ -809,20 +1016,27 @@ test('executeBatch reports the worst effect across all steps', async () => {
     'unverifiable',
     'noop',
   ])
+  assert.match(batch.results[1].advice, /screen_observe|重新/)
 })
 
-test('executeBatch validates its inputs and propagates step validation errors', async () => {
+test('executeBatch records per-step validation errors instead of losing earlier results', async () => {
   const backend = createFakeBackend()
 
   await assert.rejects(executeBatch(backend, { steps: 'nope' }), /steps/)
-  await assert.rejects(
-    executeBatch(backend, {
-      steps: [{ op: 'click' }],
-      observation: OBSERVATION,
-    }),
-    (error) => error instanceof MissingTarget,
-  )
-  assert.equal(backend.calls.length, 0)
+
+  const batch = await executeBatch(backend, {
+    steps: [{ op: 'click', target: { element: 'save' } }, { op: 'click' }],
+    observation: OBSERVATION,
+    observeAfter: false,
+  })
+
+  assert.equal(batch.effect, 'refused')
+  assert.equal(batch.failedAt, 1)
+  assert.equal(batch.results.length, 2)
+  assert.equal(batch.results[0].effect, 'confirmed')
+  assert.equal(batch.results[1].effect, 'refused')
+  assert.match(batch.results[1].detail, /requires a target/)
+  assert.deepEqual(actionCalls(backend).map((call) => call.method), ['click'])
 })
 
 test('an empty batch is a noop with no results', async () => {
