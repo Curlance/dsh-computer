@@ -9,7 +9,7 @@
 
 ## 1. 信任根
 
-- 更新源固定为本仓库的 GitHub Releases（README 以 `Curlance/dsh-computer-use` 为准）；
+- 更新源固定为本仓库的 GitHub Releases（README 以 `Curlance/dsh-computer` 为准）；
   发布工作流用 `${{ github.repository }}` 生成下载 URL，所以 fork 也能产出指向自己的 `compat.json`。
 - 完整性：每个版本在 `compat.json` 里带 tarball 的 sha256；下载后先校验，再写任何插件目录。
 - **不做签名**（评审决定）：sha256 只防损坏/传输错误，不防仓库账号被篡改。
